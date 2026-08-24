@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# This branch tracks ONLY the C++ estimator and its EuRoC configurations.
+#
+# It shares a working tree with the private research repository, which also
+# holds datasets, evaluation results, manuscripts and third-party reference
+# implementations. None of that belongs here, so the rule is a whitelist:
+# ignore everything, then re-admit exactly the two things this branch is for.
+# ---------------------------------------------------------------------------
+*
+
+!.gitignore
+!README.md
+!cpp_gtsam_vio/
+!cpp_gtsam_vio/**
+
+# ... but never build output, data, or run artefacts living inside it
+cpp_gtsam_vio/build/
+cpp_gtsam_vio/results*/
+cpp_gtsam_vio/temp_configs/
+cpp_gtsam_vio/benchmark/
+cpp_gtsam_vio/logs/
+cpp_gtsam_vio/*.log
+cpp_gtsam_vio/support_files/*.bin
+*.o
+*.d

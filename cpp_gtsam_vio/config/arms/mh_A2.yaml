@@ -1,0 +1,138 @@
+# =============================================================================
+# GENERATED -- python/gen_ablation_configs.py . Do not edit by hand.
+#
+# MDPI *Drones* drones-4489122 revision -- WP-C ablation arm A2
+#   - velocity-consistency gate
+#
+# code   : commit 121449d (frozen; branch paper_repro)
+# config : commit 97062c6:config/mh_params.yaml  (the state the paper's runs used)
+# baseline: batch back-end, shared PL-VINS 20 Hz stream, inverse-depth points,
+#           deterministic, NO loop closure, covariance dumped for NEES.
+# differs from A0: init.max_vel_mps 6.0 -> 1.0e+9 (gate can never fire)
+# =============================================================================
+# =============================================================================
+# vio_params.yaml  —  central configuration for cpp_gtsam_vio
+#
+# Loaded by VioParams::load() (utils/params.{h,cpp}). Pass a custom path as the
+# 2nd CLI arg:  ./build/vio_pipeline <dataset> [config.yaml]
+# Any missing key falls back to the built-in default (the committed value).
+# All values below ARE the committed defaults (ATE 0.16 / 0.19 / 0.36).
+# =============================================================================
+
+runtime:
+  dump_covariance: true  # WP-N: per-KF marginal covariance for NEES
+  deterministic: true  # bit-reproducible (verified inert: identical results either way)
+  dump_frontend: false # write frontend_{frames,points}.csv for view_frontend.py
+  diag: true  # WP-M: [initdiag] + per-window gate-rejection lines
+  smoother_lag_s: 3.0 # fixed-lag window length [s]
+  loop_closure: false  # out of scope for the revision; `est` is unaffected by LC (verified)
+  # --- Frontend: DEFAULT is the PL-VINS 20Hz feature bags (folder mode) ---
+  frontend_source: folder  # PAPER: shared PL-VINS 20 Hz stream (isolates the back-end)
+  frontend_dir: "" # empty -> auto-derived per sequence: <dataset_parent>/<frontend_root>/<name>
+  frontend_root: Euroc_frontend_20HZ # subdir under the dataset parent with per-sequence feature folders
+  # --- Backend smoother + point representation (defaults = committed baseline) ---
+  backend_mode: batch  # PAPER: GTSAM BatchFixedLagSmoother
+                          # batch = gtsam BatchFixedLagSmoother (LM, time lag; the reference arm)
+                          # incremental = gtsam IncrementalFixedLagSmoother (ISAM2)
+  # Defaults chosen on the full 11-sequence EuRoC sweep (77 runs, no LC, deterministic).
+  point_backend: invdepth # invdepth = explicit inverse-depth landmarks | smart = SmartProjectionPoseFactor (needs backend_mode=incremental)
+  isam_relin_threshold: 0.0005 # ISAM2 relinearizeThreshold. MH_04-inc is chaotic near this knob: 0.001 diverges points (4.03); [2e-4,2e-3] is a healthy plateau. Batch stays the robust reference.
+  isam_relin_skip: 1 # ISAM2 relinearizeSkip
+  bias_accel_max: 0.0 # bias-clamp DISABLED (minimal_safe ablation): was a 10Hz-era ISAM2 guard, inert under folder-20Hz on both backends (MH_04-inc fine without it)
+  bias_gyro_max: 0.5 # bias-clamp: reject post-update gyro bias [rad/s] above this
+
+point_frontend: # FeatureTracker
+  max_points: 150 # max KLT points
+  min_dist_px: 30 # min spacing between points [px]
+  fb_err: 1.0 # forward-backward consistency [px]
+  ransac_thresh: 1.0 # fundamental-matrix RANSAC threshold [px]
+  quality: 0.01 # goodFeaturesToTrack quality level
+
+# IMU noise. The four densities are the EXACT EuRoC imu0/sensor.yaml values.
+# The *_cov_mult are the inflation the code applies in the VARIANCE domain
+# (i.e. setAccelerometerCovariance(acc_n^2 * acc_cov_mult), ...). A cov mult of
+# 100 == sigma x10. Rationale: inflate IMU white noise -> trust vision more;
+# keep bias random-walk permissive enough to track real bias drift.
+imu_noise:
+  acc_n: 2.0000e-3 # accelerometer_noise_density  [m/s^2/sqrt(Hz)]
+  gyr_n: 1.6968e-4 # gyroscope_noise_density       [rad/s/sqrt(Hz)]
+  acc_w: 3.0000e-3 # accelerometer_random_walk     [m/s^3/sqrt(Hz)]
+  gyr_w: 1.9393e-5 # gyroscope_random_walk         [rad/s^2/sqrt(Hz)]
+  acc_cov_mult: 100.0 # applied to acc_n^2
+  gyr_cov_mult: 10.0 # applied to gyr_n^2
+  acc_bias_cov_mult: 100.0 # applied to acc_w^2
+  gyr_bias_cov_mult: 10.0 # applied to gyr_w^2
+  integration_cov: 1.0e-6 # setIntegrationCovariance
+  bias_acc_omega_int: 1.0e-5 # CombinedImuFactor bias/preint cross-term
+
+init:
+  window: 10 # InitBuffer keyframe window size
+  parallax_px: 10.0 # InitBuffer keyframe parallax gate [px]
+  min_common: 20 # InitBuffer min common tracks
+  excitation_var: 0.25 # check_imu_excitation accel-variance threshold
+  max_pre_ba_rms_px: 8.0 # defer-until-well-conditioned gate; reject window if higher (8px suits 20Hz folder init)
+  max_vel_mps: 1.0e+9  # <<< ABLATION A2 >>> init.max_vel_mps 6.0 -> 1.0e+9 (gate can never fire)
+  # continuous-window VI-BA gauge priors
+  iw_pose0_sigma: 1.0e-3 # X(0) prior sigma (rot & trans)
+  iw_vel0_sigma: 0.3 # V(0) prior sigma [m/s]
+  iw_bias0_acc_sigma: 0.1 # B(0) accel-bias prior sigma
+  iw_bias0_gyr_sigma: 0.02 # B(0) gyro-bias prior sigma
+
+point_factor: # reprojection factor (inverse-depth points)
+  huber_k: 0.1 # Huber threshold on whitened residual (heavy robustification)
+  sigma_px: 1.0 # isotropic pixel sigma
+
+smart_factor: # SmartProjectionPoseFactor (point_backend=smart). Noise is isotropic;
+              # outliers are rejected by dynamic reprojection threshold, not a robust kernel.
+  sigma_px: 1.0       # isotropic pixel noise
+  rank_tol: 1.0       # triangulation rank tolerance
+  landmark_dist: 10.0 # reject landmarks farther than this [m] (Kimera default)
+  retriang_th: 1.0e-3 # retriangulation threshold [m]
+  outlier_px: 3.0     # dynamic outlier reprojection rejection [px]
+
+keyframe: # backend keyframe gating
+  parallax_px: 30.0 # avg parallax to trigger a keyframe [px]
+  min_tracked: 40 # force KF if fewer than this carried over
+  max_interval: 10 # force KF every N frames (bounds preintegration)
+
+landmark: # delayed-init triangulation gates
+  min_baseline_m: 0.10 # min triangulation baseline [m]
+  tri_depth_min: 0.01 # triangulate_dlt cheirality gate DISABLED (minimal_safe: redundant, removal net-neutral)
+  tri_depth_max: 1000000 # triangulate_dlt cheirality gate DISABLED
+  depth_min: 0.01 # accepted-landmark depth gate DISABLED (minimal_safe: subset of tri gate, never fired)
+  depth_max: 1000000 # accepted-landmark depth gate DISABLED
+  floor_prior_sigma: 1.0 # point inverse-depth (theta,phi,rho) floor prior
+  # --- point-landmark bulletproofing (VINS-Mono / Kimera analogs); all <=0 = off ---
+  point_obs_reject_px: 20.0      # per-observation dynamic rejection (Kimera outlierRejection, 8px there):
+                                # drop a measurement whose predicted-vs-observed pixel error exceeds this
+  point_cull_depth_min: 0.0     # post-solve depth cull (VINS setDepth/removeFailures): cull landmark if
+  point_cull_depth_max: 0.0     # optimized inverse depth <=0 or depth outside [min,max] m
+
+loop: # DBoW2 detection + 4-DoF pose graph. Defaults reproduce committed behaviour.
+  # Front A.1 — detection gates. Lower score_best/score_cand/min_inliers to surface
+  # more revisit candidates; the PnP + F-RANSAC + |t|/yaw chain still rejects false loops.
+  skip_recent: 50      # ignore KFs within this temporal gap
+  fast_threshold: 10   # FAST corner threshold for DBoW harvest (10 = recovers loop recall on low-texture seqs; big MH_02/V1_03/V2_03 LC gains)
+  min_inliers: 30      # PnP inlier gate
+  hamming_th: 80       # BRIEF match accept threshold (of 256)
+  score_best: 0.05     # best DBoW score must exceed this
+  score_cand: 0.015    # candidate DBoW score must exceed this
+  fund_thresh_px: 3.0  # fundamental-matrix RANSAC px threshold
+  max_trans_m: 3.0     # loop relative-translation sanity gate [m]
+  max_yaw_deg: 30.0    # loop relative-yaw sanity gate [deg]
+  # Front B — pose-graph use (make detected loops net-non-harmful). Defaults = today.
+  backbone_hops: 1        # odometry edges per node to its N predecessors (VINS-Mono=4). 1=single-hop (committed). Higher stiffens the chain to bound low-drift LC-hurt.
+  loop_trans_sigma: 0.1   # base loop-edge translation sigma [m]
+  loop_rot_sigma: 0.05    # base loop-edge rotation sigma [rad]
+  cauchy_c: 1.0           # robust (Cauchy) kernel scale
+  inlier_weighting: true  # true: tighten loop sigma by sqrt(min_inliers/inliers)
+  min_correction_m: 0.00   # drift-consistency gate
+  loop_drift_rate: 0.03     # signal-vs-noise gate: skip loop if correction > rate*path_length (implausible drift = PnP noise; 0=off).
+                            # 0.03 = unified value: still gates MH_01's junk edges (5.5-8.7% drift rate, keeps ~-6mm +LC)
+                            # while admitting MH_02-inc's REAL 2.5-2.8% loops (0.02 gated them: +45mm regression)
+
+zupt: # zero-velocity update (stationary detector)
+  acc_var: 0.1 # accel variance threshold [(m/s^2)^2]
+  gyr_var: 0.002 # gyro variance threshold [(rad/s)^2]
+  disp_px: 1.5 # median feature displacement threshold [px]
+  vel_sigma: 0.01 # zero-velocity prior sigma [m/s]
