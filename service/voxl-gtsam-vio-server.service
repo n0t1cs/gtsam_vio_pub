@@ -1,0 +1,16 @@
+[Unit]
+Description=voxl-gtsam-vio-server (GTSAM VIO on MPA pipes)
+SourcePath=/usr/bin/voxl-gtsam-vio-server
+After=voxl-wait-for-fs.service voxl-imu-server.service voxl-camera-server.service
+Requires=voxl-wait-for-fs.service
+
+[Service]
+User=root
+Type=simple
+PIDFile=/run/voxl-gtsam-vio-server.pid
+ExecStart=/usr/bin/voxl-gtsam-vio-server -c /etc/modalai/voxl-gtsam-vio-server.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

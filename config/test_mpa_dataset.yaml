@@ -1,0 +1,19 @@
+# DESKTOP TEST: voxl-gtsam-vio-server fed by gvio-replay --dataset through pipes under
+# /tmp/gvio_mpa/ (no root needed). The camera is the dataset's own pinhole sensor.yaml, the IMU filter
+# is off because the dataset's IMU is assumed already low-passed. Replace DATASET with a EuRoC-format
+# dataset (mav0/{imu0,cam0}). Run (two terminals, from the repository root):
+#   build/voxl-gtsam-vio-server -c config/test_mpa_dataset.yaml
+#   build/gvio-replay --dataset DATASET \
+#       --imu-pipe /tmp/gvio_mpa/imu_apps --cam-pipe /tmp/gvio_mpa/tracking_front_misp_norm \
+#       --lockstep /tmp/gvio_mpa/gvio_extended
+estimator_config: config/estimator_mantis2.yaml
+imu_pipe: /tmp/gvio_mpa/imu_apps
+camera_pipe: /tmp/gvio_mpa/tracking_front_misp_norm
+sensor_yaml: DATASET/mav0/cam0/sensor.yaml
+imu_lowpass:
+  enable: false
+output_pipe: /tmp/gvio_mpa/gvio
+output_pipe_extended: /tmp/gvio_mpa/gvio_extended
+log_dir: runs/test_mpa_dataset
+pid_file: false
+verbose: true

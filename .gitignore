@@ -1,0 +1,6 @@
+# build products and local run logs
+build/
+build_*/
+pkg_*/
+*.deb
+runs/

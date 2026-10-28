@@ -1,0 +1,21 @@
+# DESKTOP TEST: voxl-gtsam-vio-server on a raw VOXL log replayed by gvio-replay --voxl-log through
+# pipes under /tmp/gvio_mpa/, with the log's own calibration files: the deployment path, as on the
+# vehicle. Replace VOXL_LOG with a voxl-logger directory that also holds the vehicle's
+# data/modalai and etc/modalai calibration files. Run from the repository root:
+#   build/voxl-gtsam-vio-server -c config/test_mpa_voxl_log.yaml
+#   build/gvio-replay --voxl-log VOXL_LOG \
+#       --imu-pipe /tmp/gvio_mpa/imu_apps --cam-pipe /tmp/gvio_mpa/tracking_front_misp_norm --rate 1
+estimator_config: config/estimator_mantis2.yaml
+imu_pipe: /tmp/gvio_mpa/imu_apps
+camera_pipe: /tmp/gvio_mpa/tracking_front_misp_norm
+camera_name: tracking_front
+imu_frame: imu_apps
+intrinsics_file: VOXL_LOG/data/modalai/opencv_tracking_front_intrinsics.yml
+extrinsics_file: VOXL_LOG/etc/modalai/extrinsics.conf
+imu_lowpass:
+  enable: true
+output_pipe: /tmp/gvio_mpa/gvio
+output_pipe_extended: /tmp/gvio_mpa/gvio_extended
+log_dir: runs/test_mpa_voxl_log
+pid_file: false
+verbose: true

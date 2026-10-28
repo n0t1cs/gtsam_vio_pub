@@ -1,0 +1,46 @@
+# /etc/modalai/voxl-gtsam-vio-server.yaml: voxl-gtsam-vio-server on a VOXL2 (MANTIS_2 defaults).
+# The estimator's own parameters are in estimator_config (vendored from cpp_gtsam_vio).
+
+estimator_config: /usr/share/voxl-gtsam-vio/estimator_mantis2.yaml
+
+# Inputs. A name lives under /run/mpa/, a full path is used as is.
+imu_pipe: imu_apps                       # the body frame of the estimator (imu0 of the datasets)
+camera_pipe: tracking_front_misp_norm    # the ISP-normalised stream the datasets used
+camera_name: tracking_front              # its entry (child) in extrinsics.conf
+imu_frame: imu_apps                      # the parent of that entry
+intrinsics_file: /data/modalai/opencv_tracking_front_intrinsics.yml
+extrinsics_file: /etc/modalai/extrinsics.conf
+undistort_balance: 0.0                   # the datasets' value (focal 389.0 px on MANTIS_2)
+pinhole_override: []                     # [fu, fv, cu, cv]: pin the virtual pinhole (parity tests).
+                                         # Never leave a pin after recalibrating the camera.
+camera_time_offset_ns: 0                 # 0 = metadata stamp (start of exposure), as offline
+
+# The IMU low-pass of every mantis_qualisys_<log>_lpf dataset (the IMU noise was calibrated on it).
+imu_lowpass:
+  enable: true
+  order: 4
+  cutoff_hz: 25.0
+  rate_hz: 0                             # 0 = measured from the first 1024 samples
+
+# Outputs, ModalAI's VIO interface. To fly on it, set vio_pipe in voxl-vision-hub.conf to
+# output_pipe (validate on the bench first, README.md).
+output_pipe: gvio
+output_pipe_extended: gvio_extended
+soft_reset_keeps_frame: true             # an automatic reset continues the published frame
+
+realtime:
+  max_pending_frames: 3                  # frames waiting for IMU coverage, oldest dropped beyond
+  imu_wait_timeout_s: 0.3
+
+health:                                  # defaults from the vehicle's voxl-open-vins-server.conf
+  auto_reset: true
+  max_velocity_mps: 20.0
+  min_features: 1
+  min_features_timeout_s: 3.0
+  max_imu_gap_s: 0.1
+  max_frame_gap_s: 1.0
+  input_timeout_s: 1.0
+
+log_dir: /data/gvio                      # a timestamped folder per start, empty = no log
+pid_file: true
+verbose: false

@@ -1,0 +1,140 @@
+# =============================================================================
+# estimator_mantis2.yaml: the estimator configuration of voxl-gtsam-vio, tuned on indoor flights of
+# a VOXL2 quadrotor (MANTIS-class airframe) with motion capture.
+#
+# Sensors it assumes: imu_apps at about 1 kHz as the body IMU, low-passed online by the server
+# (Butterworth order 4 at 25 Hz, imu_lowpass in voxl-gtsam-vio-server.yaml), and the ISP-normalised
+# front tracking camera (tracking_front_misp_norm, 18 to 24 Hz), undistorted online to a pinhole of
+# focal about 389 px.
+#
+# The settings that matter most:
+#   runtime         backend_mode incremental (iSAM2, the only backend), a 10-keyframe window,
+#                   Cholesky factorisation, deterministic (TBB pinned to one thread).
+#   imu_noise       white noise from the in-flight noise floor of the filtered stream, random walk
+#                   from a 24 h Allan fit of the same IMU. Recalibrate them for another vehicle.
+#   point_frontend  global histogram equalisation, 150 points on a 1x1 grid.
+#   keyframe        max_interval 10 frames (about 0.5 s at 20 Hz).
+#   landmark        min_baseline_m 0.02 (hover), exact re-anchoring with retire and at most 25
+#                   live chains.
+#   zupt            disp_px 0.0 switches the zero-velocity update off (it fired during hover).
+# Pixel thresholds are scaled to the 389 px focal length. On another camera scale
+# init.parallax_px, init.max_pre_ba_rms_px, point_frontend.min_dist_px, keyframe.parallax_px and
+# landmark.point_obs_reject_px by the ratio of the focal lengths.
+# Ignored online: loop_closure, frontend_source (online always tracks its own images),
+# dump_frontend, init.oracle_gravity.
+# =============================================================================
+
+runtime:
+  dump_frontend: false
+  diag: true
+  loop_closure: false
+  frontend_source: images
+  deterministic: true
+  dump_covariance: true
+  frontend_dir: ""
+  frontend_root: Euroc_frontend_20HZ
+  backend_mode: incremental
+  kf_window_size: 10
+  point_backend: invdepth
+  isam_relin_threshold: 0.0005
+  isam_relin_skip: 1
+  isam_factorization: cholesky
+  bias_accel_max: 0.0
+  bias_gyro_max: 0.5
+
+point_frontend:
+  max_points: 150
+  min_dist_px: 51
+  fb_err: 1.0
+  ransac_thresh: 1.0
+  quality: 0.01
+  grid_x: 1
+  grid_y: 1
+  histogram_eq: equalize
+  clahe_clip: 2.0
+
+imu_noise:
+  acc_n: 0.012
+  gyr_n: 0.0015
+  acc_w: 9.6831e-5
+  gyr_w: 4.0163e-6
+  acc_cov_mult: 1.0
+  gyr_cov_mult: 1.0
+  acc_bias_cov_mult: 1.0
+  gyr_bias_cov_mult: 1.0
+  integration_cov: 1.0e-4
+  bias_acc_omega_int: 1.0e-5
+
+init:
+  window: 10
+  parallax_px: 8.5
+  min_common: 20
+  excitation_var: 0.10
+  max_pre_ba_rms_px: 6.8
+  max_vel_mps: 6.0
+  iw_pose0_sigma: 1.0e-3
+  iw_vel0_sigma: 0.3
+  iw_bias0_acc_sigma: 0.1
+  iw_bias0_gyr_sigma: 0.02
+
+point_factor:
+  huber_k: 0.1
+  sigma_px: 1.0
+  hetero_cov: false
+  hetero_metric: age
+  hetero_fb_ref: 0.3
+  hetero_age_full: 5.0
+  hetero_parallax_ref: 1.0
+  hetero_sigma_max: 4.0
+
+smart_factor:
+  sigma_px: 1.0
+  rank_tol: 1.0
+  landmark_dist: 10.0
+  retriang_th: 1.0e-3
+  outlier_px: 3.0
+
+keyframe:
+  parallax_px: 25.4
+  min_tracked: 40
+  max_interval: 10
+
+landmark:
+  min_baseline_m: 0.02
+  reanchor: exact
+  reanchor_sigma: 1.0e-4
+  reanchor_retire: true
+  reanchor_live_max: 25
+  tri_depth_min: 0.01
+  tri_depth_max: 1000000
+  depth_min: 0.01
+  depth_max: 1000000
+  floor_prior_sigma: 1.0
+  point_obs_reject_px: 17.0
+  point_cull_depth_min: 0.0
+  point_cull_depth_max: 0.0
+
+loop:
+  skip_recent: 50
+  fast_threshold: 10
+  min_inliers: 30
+  hamming_th: 80
+  score_best: 0.05
+  score_cand: 0.015
+  fund_thresh_px: 3.0
+  max_trans_m: 3.0
+  max_yaw_deg: 30.0
+  backbone_hops: 1
+  loop_trans_sigma: 0.1
+  loop_rot_sigma: 0.05
+  cauchy_c: 1.0
+  inlier_weighting: true
+  min_correction_m: 0.00
+  loop_drift_rate: 0.03
+
+zupt:
+  acc_var: 0.1
+  gyr_var: 0.002
+  disp_px: 0.0
+  vel_sigma: 0.01
+
