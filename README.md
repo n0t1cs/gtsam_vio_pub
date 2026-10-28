@@ -21,7 +21,8 @@ offline estimate byte for byte (Validation).
 | online engine (`src/engine`) | built and validated on an x86 desktop (Validation) |
 | published frame | checked against motion capture: no axis flip, 9.7 cm rms after aligning one pose |
 | MPA server and pipe replay (`src/server`, `tools/gvio_replay.cpp`) | passes a syntax check against the libmodal-pipe headers, not yet linked or run on real pipes |
-| VOXL2 build and package (`scripts/build_voxl2.sh`, `make_package.sh`) | written, untested |
+| VOXL2 build on the board (`scripts/build_voxl2_native.sh`) | dependencies and engine built on a VOXL2 (system image 1.8). The server's first build there failed on a libmodal-pipe function the board's version lacks, now fixed. Full run of the script pending |
+| cross build and package (`scripts/build_voxl2.sh`, `make_package.sh`) | written, untested |
 | flight | not done. Bench test first (below) |
 
 ## How it works
@@ -86,7 +87,27 @@ terminals, as in the header of `config/test_mpa_voxl_log.yaml`. On a desktop `/r
 root-owned, so the test configs put every pipe under `/tmp/gvio_mpa/` (libmodal-pipe uses any
 location that starts with `/` as is).
 
-## Building for the VOXL2 (untested)
+## Building for the VOXL2
+
+### On the board
+
+As root on the VOXL2 (system image 1.x, Ubuntu 18.04), with a fan on the board and bench power:
+
+```bash
+apt-get install -y cmake build-essential gcc-8 g++-8 libboost-serialization-dev libboost-system-dev \
+  libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-date-time-dev \
+  libboost-timer-dev libboost-chrono-dev libboost-regex-dev
+git clone -b voxl --single-branch https://github.com/n0t1cs/gtsam_vio_pub.git /data/voxl-gtsam-vio
+bash /data/voxl-gtsam-vio/scripts/build_voxl2_native.sh      # about 2 h, re-run it to resume
+```
+
+yaml-cpp and OpenCV go to `/data/gvio_deps/stage` (static), GTSAM 4.2a9 to `/usr/local` (shared, no
+TBB), the binaries to `build/`. The script's header lists what the first build on a VOXL2 taught: gcc
+8, 3 parallel jobs, gcc's temporary files on `/data` (the root filesystem can be nearly full), and the
+64-bit MPA libraries in `/usr/lib64`. The board's libmodal-pipe (voxl-suite 1.5.1) has no
+`mpa_time_monotonic_ns`, so the server and `gvio-replay` read CLOCK_MONOTONIC themselves.
+
+### Cross build (untested)
 
 Inside ModalAI's `voxl-cross` docker:
 
@@ -184,6 +205,6 @@ tools/         gvio_engine_replay.cpp (desktop bench, no MPA), gvio_replay.cpp (
                published on pipes), gvio_publish_check.cpp (the published frame on a log, no MPA)
 config/        voxl-gtsam-vio-server.yaml (vehicle), estimator_mantis2.yaml, test_mpa_*.yaml
                (desktop MPA tests, pipes under /tmp/gvio_mpa)
-scripts/       eval_online.py, build_mpa_x86.sh, build_voxl2.sh, make_package.sh
+scripts/       eval_online.py, build_mpa_x86.sh, build_voxl2_native.sh, build_voxl2.sh, make_package.sh
 service/       systemd unit
 ```

@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <limits>
 
@@ -16,7 +17,13 @@ static const char* kControlCommands = RESET_VIO_SOFT "," RESET_VIO_HARD;
 static constexpr int kImuPipeSize = 1 * 1024 * 1024;     // QVIO's sizes: big buffers, never drop on the pipe
 static constexpr int kCamPipeSize = 256 * 1024 * 1024;
 
-static int64_t wall_ns() { return mpa_time_monotonic_ns(); }
+// CLOCK_MONOTONIC, the clock of every MPA stamp. Same as mpa_time_monotonic_ns(), which only
+// libmodal-pipe 2.15.1 and later provide (VOXL2 voxl-suite 1.5 ships an older one).
+static int64_t wall_ns() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+}
 
 // A pipe given by name lives under MODAL_PIPE_DEFAULT_BASE_DIR, a full path (desktop tests) as is.
 static void make_info(pipe_info_t& info, const std::string& name_or_path, const char* type, int size) {

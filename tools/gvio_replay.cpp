@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -41,6 +42,13 @@ static std::vector<std::string> split(const std::string& line) {
     std::string x;
     while (std::getline(ss, x, ',')) out.push_back(x);
     return out;
+}
+
+// CLOCK_MONOTONIC, as mpa_time_monotonic_ns() (libmodal-pipe 2.15.1 and later only).
+static int64_t mono_ns() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
 }
 
 static std::atomic<int64_t> g_last_out_cam_t{-1};
@@ -161,7 +169,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     const int64_t s0 = std::min(frames.front().t_ns, imu.front().t_ns);
-    const int64_t shift = live ? (mpa_time_monotonic_ns() - s0) : 0;
+    const int64_t shift = live ? (mono_ns() - s0) : 0;
     auto send_imu = [&](size_t& j, int64_t up_to) {
         std::vector<imu_data_t> b;
         while (j < imu.size() && imu[j].t_ns <= up_to) {
