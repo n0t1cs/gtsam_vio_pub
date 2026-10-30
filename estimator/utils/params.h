@@ -15,16 +15,57 @@ struct VioParams {
     // -------------------- runtime --------------------
     bool   dump_frontend     = false;  // write frontend_{frames,points}.csv
     bool   diag              = false;  // per-KF [viodiag] + [initdiag] diagnostic prints
-    // Consistency outputs.
+    // Consistency-study knobs.
     bool   dump_covariance   = false;  // dump per-KF pose + 6x6 marginal covariance for NEES
     bool   dump_relcov       = false;  // dump per-KF relative pose + covariance (spans 1, 8 KF) for relative NEES
     bool   deterministic     = false;  // pin TBB to 1 thread for bit-reproducible runs (NEES needs it)
     int    rng_seed          = 0;      // seed of every OpenCV/std RANSAC (main and front-end threads).
                                        // 0 = the historical seed. Other values give runs that differ
                                        // only in random sampling (seed sets).
-    // The window is keyframe-indexed. VioParams::load rejects configs that ask for a
-    // time window (smoother_lag_s, window_coord: time).
-    int    kf_window_size    = 10;     // sliding window length in KEYFRAMES (N_kf)
+    // The window is ALWAYS keyframe-indexed: both backends hold the same N_kf window.
+    // The time window (smoother_lag_s, window_coord: time) and the batch backend were
+    // removed on 2026-10-08. VioParams::load rejects configs that depend on them;
+    // they are not part of this release.
+    int    kf_window_size    = 10;     // sliding window length in KEYFRAMES (N_kf), both backends
+    bool   kf_use_fej        = true;   // backend_mode=keyframe ONLY: first-estimate Jacobians at the marginalization
+                                       // boundary. true = linearize the marginalized subgraph at each
+                                       // boundary variable's FROZEN first estimate (consistency);
+                                       // false = at the current estimate (the noFEJ A/B arm).
+    int    kf_max_iterations = 10;     // backend_mode=keyframe ONLY: window re-optimization iterations per
+                                       // update(). The filter<->smoother knob: 10 = a re-linearizing
+                                       // sliding-window smoother; 1 = a single linearization per step, i.e.
+                                       // an (iterated-)EKF update. Small kf_window_size + kf_max_iterations=1
+                                       // degenerates the keyframe smoother toward a filter on ONE code path.
+    std::string kf_optimizer = "gn";   // backend_mode=keyframe ONLY: window solver. "gn" = Gauss-Newton
+                                       // (undamped full step, THE DEFAULT); "lm" = Levenberg-Marquardt
+                                       // (damped). With kf_max_iterations=1, "gn" makes each update a single
+                                       // EKF-style correction (matching the incremental/iSAM2 arm). GN was
+                                       // promoted to default on the 11-seq study: == LM on ATE/NEES, never
+                                       // diverges (LM's damping is inert here), and ~5% faster (p95 -11%).
+    std::string kf_marg_elim = "cholesky"; // backend_mode=keyframe ONLY: linear-algebra form of the Schur
+                                       // marginalization. "cholesky" = GTSAM's EliminatePreferCholesky
+                                       // (THE DEFAULT, and what every result in the report was measured
+                                       // with): builds the normal equations, so the marginal is obtained
+                                       // at cond(J)^2. "qr" = EliminateQR: square-root form, eliminates on
+                                       // the Jacobian directly at cond(J), never forms J^T J.
+                                       // In double precision the two are
+                                       // algebraically equivalent and the predicted ATE/NEES delta is ZERO.
+                                       // A non-null result means the window sits nearer the conditioning
+                                       // cliff than assumed. Scope is the marginalization boundary ONLY —
+                                       // the window solve's own factorization is a separate lever.
+    bool   kf_diag_cond      = false;  // backend_mode=keyframe ONLY: S2 diagnostic. Log cond(J) of the
+                                       // system each Schur step eliminates, plus the resulting prior's
+                                       // spectrum, to <out>/kf_cond.csv. cond(J) is the number the
+                                       // square-root argument turns on: Cholesky forms J^T J and works at
+                                       // cond(J)^2, and float32 (eps^-1 ~ 1.2e7) fails once cond(J)^2
+                                       // nears that — so this measures the float32 margin from a float64
+                                       // run. EXPENSIVE (dense SVD per marginalization): diagnostic runs
+                                       // only, their timing is NOT Pareto-comparable. Default off.
+    std::string kf_fej_scope = "xv";   // backend_mode=keyframe ONLY: WHICH states are held at first estimates.
+                                       // "xv"  = pose+velocity only (the VI unobservable directions:
+                                       //         global position + yaw) — biases/landmarks relinearize;
+                                       // "xvb" = also freeze the IMU biases;
+                                       // "all" = also freeze landmarks (widest, most linearization error).
     bool   loop_closure      = true;   // DBoW2 detection + 4-DoF pose graph (non-invasive:
                                        // est stays clean no-LC, lc = pose-graph trajectory).
                                        // false = pure VIO, no pose graph (no-LC A/B baseline)
@@ -40,8 +81,16 @@ struct VioParams {
     std::string frontend_dir    = "";
     std::string frontend_root   = "Euroc_frontend_20HZ";  // subdir under the dataset parent
                                                           // holding the per-sequence feature folders
-    // Backend smoother + point representation (config-gated).
-    std::string backend_mode  = "incremental"; // IncrementalFixedLagSmoother (iSAM2), the only backend
+    // Backend smoother + point representation (config-gated). Code defaults are not the
+    // system: the committed configs select backend_mode: incremental with
+    // isam_factorization: cholesky (iSAM2 on the keyframe window, the system default
+    // since 2026-10-08). The code default stays keyframe so older configs without the
+    // key keep their meaning.
+    std::string backend_mode  = "keyframe"; // "incremental" = IncrementalFixedLagSmoother (ISAM2), committed default
+                                            // "keyframe" = KeyframeSmoother (SLKS): standalone N_kf-keyframe
+                                            //   window + Schur marginalization + switchable, scoped FEJ
+                                            //   ("kf_fej" is accepted as a legacy alias)
+                                            // "batch" was removed (rejected by VioParams::load)
     std::string point_backend = "invdepth"; // "invdepth" = explicit inverse-depth landmarks
                                             // "smart" = SmartProjectionPoseFactor (marginalized);
                                             //           REQUIRES backend_mode=incremental
@@ -200,7 +249,7 @@ struct VioParams {
     // is in the same units only if (w_t + w_rt) == 1; scale kf_parallax_px by (w_t + w_rt) to
     // hold the pure-translation trigger point fixed. Measured: dropping the combined term
     // entirely (w = 1,0,0) is WORSE on ATE and NEES at every threshold, including at matched
-    // keyframe rate.
+    // keyframe rate -- see KF_FEJ_smoother.
     double kf_shift_weight_t  = 0.0;   // weight on TRANSLATION-only flow  (DSO 0.04)
     double kf_shift_weight_r  = 0.0;   // weight on ROTATION-only flow     (DSO 0.00)
     double kf_shift_weight_rt = 1.0;   // weight on FULL flow              (DSO 0.02)
@@ -242,7 +291,7 @@ struct VioParams {
                                            // 1 -> 0: max remaining baseline, but re-hosts every keyframe).
                                            // false = re-host on the current keyframe: longest lifetime
                                            // before the next re-host, ~N_kf times less key churn.
-    // Landmark continuity. Both off = the plain system,
+    // Landmark continuity. Both off = the committed system,
     // bit for bit. invdepth only, and neither combines with point_depth_transfer.
     bool   lm_init_current_obs    = false; // the observation of the keyframe at which a landmark
                                            // is (re)initialised becomes a factor. Off: it is not

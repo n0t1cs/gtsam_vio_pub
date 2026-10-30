@@ -6,13 +6,14 @@ interface (`vio_data_t`, `ext_vio_data_t`), so `voxl-vision-hub`, `voxl-inspect-
 and the portal read it like the on-board `qvio` and `ov` pipes.
 
 The estimator is the offline one, unchanged: KLT and Shi-Tomasi tracking with IMU-aided flow
-prediction, a VINS-Mono-style initialisation, inverse-depth landmarks and iSAM2
-(`IncrementalFixedLagSmoother`) over a window of 10 keyframes. It descends from the reference
-implementation on branch `paper_repro` of this repository (MDPI *Drones*, manuscript
-`drones-4489122`) and has changed since: the window is counted in keyframes instead of 3 s, iSAM2 is
-the only backend, landmarks are re-anchored when their anchor keyframe leaves the window, and the
-configuration is tuned for a VOXL2 quadrotor. Given the same inputs, the online engine reproduces the
-offline estimate byte for byte (Validation).
+prediction, a VINS-Mono-style initialisation, inverse-depth landmarks and one of two backends over the
+same window of 10 keyframes (Backends): iSAM2 (`IncrementalFixedLagSmoother`, the default) or the
+SLKS, a keyframe-indexed fixed-lag smoother with explicit Schur marginalisation and first-estimates
+Jacobians at the marginalisation boundary. It descends from the reference implementation on branch
+`paper_repro` of this repository (MDPI *Drones*, manuscript `drones-4489122`) and has changed since:
+the window is counted in keyframes instead of 3 s, the SLKS is available, landmarks are re-anchored
+when their anchor keyframe leaves the window, and the configuration is tuned for a VOXL2 quadrotor.
+Given the same inputs, the online engine reproduces the offline estimate byte for byte (Validation).
 
 ## Status
 
@@ -20,8 +21,9 @@ offline estimate byte for byte (Validation).
 |---|---|
 | online engine (`src/engine`) | built and validated on an x86 desktop (Validation) |
 | published frame | checked against motion capture: no axis flip, 9.7 cm rms after aligning one pose |
-| MPA server and pipe replay (`src/server`, `tools/gvio_replay.cpp`) | passes a syntax check against the libmodal-pipe headers, not yet linked or run on real pipes |
-| VOXL2 build on the board (`scripts/build_voxl2_native.sh`) | dependencies and engine built on a VOXL2 (system image 1.8). The server's first build there failed on a libmodal-pipe function the board's version lacks, now fixed. Full run of the script pending |
+| MPA server (`src/server`) | run on a VOXL2 with iSAM2, fed by ModalAI's `voxl-replay` from two recorded flights: real time on every run, no frame dropped in flight (Validation). The SLKS on the board: not yet measured |
+| pipe replay for desktops (`tools/gvio_replay.cpp`) | built on the VOXL2, not used there (the bench test uses `voxl-replay`) |
+| VOXL2 build on the board (`scripts/build_voxl2_native.sh`) | done on a VOXL2 (system image 1.8, voxl-suite 1.5.1). The project stage needs 1 parallel job (below) |
 | cross build and package (`scripts/build_voxl2.sh`, `make_package.sh`) | written, untested |
 | flight | not done. Bench test first (below) |
 
@@ -38,7 +40,8 @@ offline estimate byte for byte (Validation).
   FrontendThread: KLT + Shi-Tomasi + F-RANSAC, IMU-aided prediction
                                                                                                  ▼
   estimator thread: initialisation search with its gates, then per frame IMU preintegration,
-  keyframe decision and the iSAM2 update, health checks and resets, per-frame output
+  keyframe decision and the backend update (iSAM2 or the SLKS), health checks and resets, per-frame
+  output
                                                                                                  ▼
   MpaBridge: estimator world -> VIO_FRAME_BODY_ALIGNED (FRD, origin at the IMU at initialisation),
   vio_data_t on `gvio`, ext_vio_data_t on `gvio_extended`, control commands reset_vio_soft/hard
@@ -60,6 +63,28 @@ Design notes:
 - **Covariance** is the keyframe's marginal, rotated into the published frame and repeated on the
   frames between keyframes. Velocity covariance is not provided (NaN).
 - **Not online:** loop closure (the output is odometry), a second camera.
+
+## Backends
+
+Both hold the same window of `kf_window_size` keyframes. Poses, velocities and biases leave it by
+age, a landmark when it was last seen too long ago. `runtime.backend_mode` selects one:
+
+- **`incremental`** (default): GTSAM's `IncrementalFixedLagSmoother` (iSAM2) with Cholesky
+  factorisation. When it marginalises, iSAM2 stores the marginal without a linearisation point and
+  keeps the variables it touches fixed, which acts as an unscoped first-estimates freeze at the
+  boundary.
+- **`keyframe`**: the SLKS (`estimator/keyframe_smoother.h`). A fixed-lag smoother that owns its graph,
+  counts its window in keyframes and marginalises with an explicit Schur complement. It knows nothing
+  about poses or landmarks: the caller stamps each variable with a keyframe index and says which
+  variables freeze at their first estimate when they enter a marginal (`kf_use_fej`, `kf_fej_scope`:
+  `xv` = poses and velocities) and which may be dropped if the window's linear system becomes
+  indeterminate (landmarks only). At `kf_max_iterations: 1` it relinearises once per keyframe, a filter
+  built from smoother code.
+
+At an equal window the two give the same accuracy and the same consistency on the EuRoC sequences, and
+iSAM2 is the cheaper one: on a desktop the SLKS takes about 2.6 times iSAM2's time per keyframe and
+about 6 % less memory. Boundary first-estimates Jacobians, declared in the SLKS and built into iSAM2,
+lower the pose NEES and raise the relative pose error per metre by 7 to 10 %.
 
 ## Requirements
 
@@ -98,14 +123,18 @@ apt-get install -y cmake build-essential gcc-8 g++-8 libboost-serialization-dev 
   libboost-filesystem-dev libboost-thread-dev libboost-program-options-dev libboost-date-time-dev \
   libboost-timer-dev libboost-chrono-dev libboost-regex-dev
 git clone -b voxl --single-branch https://github.com/n0t1cs/gtsam_vio_pub.git /data/voxl-gtsam-vio
-bash /data/voxl-gtsam-vio/scripts/build_voxl2_native.sh      # about 2 h, re-run it to resume
+bash /data/voxl-gtsam-vio/scripts/build_voxl2_native.sh      # dependencies, about 2 h at 3 jobs
+rm -rf /data/voxl-gtsam-vio/build && J=1 bash /data/voxl-gtsam-vio/scripts/build_voxl2_native.sh   # if the project stage reset the board
 ```
 
 yaml-cpp and OpenCV go to `/data/gvio_deps/stage` (static), GTSAM 4.2a9 to `/usr/local` (shared, no
 TBB), the binaries to `build/`. The script's header lists what the first build on a VOXL2 taught: gcc
-8, 3 parallel jobs, gcc's temporary files on `/data` (the root filesystem can be nearly full), and the
-64-bit MPA libraries in `/usr/lib64`. The board's libmodal-pipe (voxl-suite 1.5.1) has no
-`mpa_time_monotonic_ns`, so the server and `gvio-replay` read CLOCK_MONOTONIC themselves.
+8, gcc's temporary files on `/data` (the root filesystem can be nearly full), and the 64-bit MPA
+libraries in `/usr/lib64`. The dependencies built at 3 parallel jobs, but the project stage reset the
+board twice at 3 jobs: compiling `estimator/vio_backend.cpp` at `-O1 -g` takes about 3 GB on its own.
+At 1 job it takes 6 minutes. A reset leaves damaged object files that `make` trusts, so delete `build/`
+after one. The board's libmodal-pipe (voxl-suite 1.5.1) has no `mpa_time_monotonic_ns`, so the server
+and `gvio-replay` read CLOCK_MONOTONIC themselves.
 
 ### Cross build (untested)
 
@@ -144,16 +173,22 @@ channel's stamps by one common offset to the replay clock, so IMU and camera sta
 
 ```bash
 voxl-logger -i imu_apps -c tracking_front_misp_norm -t 120          # writes /data/voxl-logger/logNNNN/
+systemctl stop voxl-camera-server voxl-imu-server voxl-qvio-server voxl-open-vins-server
 voxl-gtsam-vio-server -v                                            # terminal 1
-voxl-replay -p /data/voxl-logger/logNNNN/ -i imu_apps -i tracking_front_misp_norm -y   # terminal 2
+voxl-replay -p /data/voxl-logger/logNNNN/ -i imu_apps -i tracking_front_misp_norm   # terminal 2
 ```
 
-`-y` stops the servers that publish the same pipes (`voxl-imu-server`, `voxl-camera-server`), otherwise
-two writers share one pipe. Before any flight, in this order:
+Stop the servers that publish the same pipes by hand, otherwise two writers share one pipe.
+`voxl-replay -y` is meant to do that, but in the voxl-logger 0.6.9 source it checks the pipe path
+without its leading `/` and never finds the running server. `voxl-replay` publishes only the `-i`
+pipes and sends the row number of the log's camera `data.csv` as `frame_id`, so the log's own clock
+is recovered exactly by matching `frames.csv` to `data.csv`. Before any flight, in this order:
 
-1. **Replay on the vehicle.** The output must match a desktop run of the same log within the
-   run-to-run noise, and the latency in `frames.csv` must stay below one frame interval. This measures
-   the VOXL2's CPU, which the desktop cannot.
+1. **Replay on the vehicle.** No frame dropped in flight, keyframe updates well below the interval
+   between keyframes, and an accuracy within the run-to-run spread of desktop runs of the same log.
+   Latency from a frame's arrival to its output is longer than one frame interval by design (it
+   waits for IMU coverage), so it is no criterion. This measures the VOXL2's CPU, which the desktop
+   cannot.
 2. **Live, hand-held,** next to the on-board VIO (`voxl-cpu-monitor` for the CPU), comparing `gvio`
    with `ov` or `qvio`.
 3. **Flight** with `vio_pipe` in `/etc/modalai/voxl-vision-hub.conf` still on the on-board VIO, `gvio`
@@ -174,10 +209,13 @@ two writers share one pipe. Before any flight, in this order:
 | `health.*` | the on-board OpenVINS server's values | automatic reset thresholds |
 | `log_dir` | /data/gvio | disk log per start, empty disables it |
 
+In the estimator config, `runtime.backend_mode` selects iSAM2 (`incremental`) or the SLKS
+(`keyframe`), Backends above.
+
 ## Validation
 
-All on an x86 desktop (`-O1`), on 11 EuRoC sequences and two indoor flights of a VOXL2 quadrotor
-with motion capture.
+On an x86 desktop (`-O1`), on 11 EuRoC sequences and two indoor flights of a VOXL2 quadrotor with
+motion capture, then on a VOXL2.
 
 - **Exactness.** In lockstep the online engine reproduces the offline estimator byte for byte on all
   13 sequences (trajectory and covariance), up to a run-to-run floating-point noise of 1e-9 to
@@ -192,7 +230,26 @@ with motion capture.
 - **Published frame.** `build/gvio-publish-check LOG` runs the bridge's conversion on a log. Against
   motion capture: 4.7 deg between the frames (2.7 deg of it is the motion-capture world's tilt),
   positions within 9.7 cm rms over 168 s after aligning one pose, body z down.
-- **Not yet:** the MPA transport (server and replay on real pipes), the VOXL2 build, flight.
+- **On a VOXL2, iSAM2.** The server built on the board (gcc 8, `-O1 -g`, GTSAM without TBB, all 8
+  cores on the `performance` governor), fed in real time by `voxl-replay` from the two recorded
+  flights, five seeds each, one run at a time. Every run kept up: no frame dropped in flight, no
+  reset. Mean and standard deviation over the five runs:
+
+  | | flight 1 (30 Hz camera) | flight 2 (19.5 Hz camera) |
+  |---|---|---|
+  | ATE on the VOXL2 (m) | 0.0595 ± 0.0047 | 0.0358 ± 0.0039 |
+  | ATE on the desktop, same seeds, lockstep (m) | 0.0583 ± 0.0054 | 0.0326 ± 0.0023 |
+  | latency p50 / p95 (ms) | 56.0 / 125.7 | 55.3 / 125.6 |
+  | keyframe update p50 / p95 (ms) | 57.5 / 75.4 | 56.6 / 72.8 |
+  | server CPU (cores) | 3.0 | 2.0 |
+  | server peak memory (MB) | 89 | 51 |
+
+  The board's runs are not the desktop's runs of the same seed (real time, float32 IMU in the pipe,
+  ARM floating point), so the comparison is between the two spreads: flight 1 matches, flight 2 is
+  9.6 % worse on average, which five runs per side cannot separate from noise (paired t-test
+  p = 0.15). The server's CPU is proportional to the frame rate, 0.10 core-seconds per frame on both
+  flights: the per-frame front-end, not the keyframe solve, sets the cost.
+- **Not yet:** the SLKS on the VOXL2, flight.
 
 ## Layout
 

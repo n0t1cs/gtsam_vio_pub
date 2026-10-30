@@ -32,16 +32,21 @@ static inline double chi2_p95(double k) {
 // true: it lets removed-factor slots be reused, which is the precondition for
 // the smart-factor delete-and-re-add slot bookkeeping (Phase 0b). Without it,
 // nullptr slots accumulate and getISAM2Result().newFactorsIndices drifts.
-// relinearize_threshold / skip come from config.
+// relinearize_threshold / skip come from config. The threshold does not act as an
+// FEJ (threshold 0 changes nothing). iSAM2's FEJ-like behaviour is
+// its built-in marginal freeze (fixedVariables_).
 static gtsam::ISAM2Params make_isam2_params(double relin_threshold, int relin_skip,
                                             const std::string& factorization) {
     gtsam::ISAM2Params p;
     p.findUnusedFactorSlots = true;
     p.relinearizeThreshold  = relin_threshold;
     p.relinearizeSkip       = relin_skip;
-    // CHOLESKY (GTSAM's default) is what the shipped configs select: at the keyframe
-    // window it gives an estimate identical to QR on the EuRoC sequences at about a
-    // quarter of the latency. QR stays the code default so earlier configs reproduce.
+    // CHOLESKY (GTSAM's default) is what the committed configs select: at the
+    // keyframe window it gives an estimate identical to QR on 11/11 EuRoC sequences
+    // at about a quarter of the latency. QR stays
+    // the code default so earlier configs reproduce. It was adopted under the removed
+    // 3 s time window, where CHOLESKY let the accel bias absorb real acceleration on
+    // MH_04's fast end segment.
     if (factorization == "cholesky") {
         p.factorization = gtsam::ISAM2Params::CHOLESKY;
     } else {
@@ -58,10 +63,12 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
                        boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params,
                        const VioParams& params)
     : params_(params),
-      // Window length in keyframes. gtsam::FixedLagSmoother uses its KeyTimestampMap
-      // only to order and evict keys, so the back-end stamps it with the KEYFRAME INDEX
-      // (win_coord()). The lag is N_kf, not N_kf - 1: findKeysBefore(current - lag)
-      // evicts stamps strictly below, after the solve, so lag = N_kf holds an N_kf + 1
+      // Window length in keyframes, for both backends. gtsam::FixedLagSmoother uses its
+      // KeyTimestampMap only to order and evict keys, so the back-end stamps it with the
+      // KEYFRAME INDEX (win_coord()), exactly as for the KeyframeSmoother. The GTSAM lag
+      // is N_kf, not N_kf - 1: findKeysBefore(current - lag) evicts stamps strictly
+      // below, marginalizeOlderThan(current - N_kf) evicts indices strictly below, and
+      // both marginalize AFTER their solve, so lag = N_kf holds the identical N_kf + 1
       // keyframe window.
       lag_(static_cast<double>(params.kf_window_size)),
       body_P_cam_(gtsam::Rot3(T_BC.block<3, 3>(0, 0)), gtsam::Point3(T_BC.block<3, 1>(0, 3))),
@@ -70,8 +77,10 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
       state_idx_(0),
       initialized_(false) {
 
-    // Backend smoother: iSAM2 (IncrementalFixedLagSmoother), the only backend in this
-    // release. VioParams::load rejects any other backend_mode.
+    // Backend smoother: incremental (ISAM2, the committed default) or the
+    // KeyframeSmoother. The smart point backend requires the incremental one. The
+    // batch backend (BatchFixedLagSmoother) was removed on 2026-10-08 and is rejected
+    // by VioParams::load.
     if (params_.backend_mode == "incremental") {
         auto isam = std::make_unique<gtsam::IncrementalFixedLagSmoother>(
             lag_,
@@ -84,9 +93,66 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
                   << (params_.isam_factorization == "cholesky" ? "CHOLESKY" : "QR") << "\n";
         if (smart_mode_)
             std::cout << "[VIO Backend] point_backend = smart (SmartProjectionPoseFactor)\n";
+    } else if (params_.backend_mode == "kf_fej" || params_.backend_mode == "keyframe") {
+        // The SLKS. STANDALONE keyframe-indexed fixed-lag smoother with
+        // explicit Schur marginalization (keyframe_smoother.h) — NOT a
+        // gtsam::FixedLagSmoother, so it is owned in its own pointer (kf_smoother_)
+        // and smoother_ stays null; VioBackend drives both through run_update()/
+        // run_estimate(). The window is N_kf keyframes, owned inside the smoother.
+        // lag_ remains the back-end's OWN re-anchoring horizon (keyframe count), which
+        // matches the smoother's window by construction. Supports the inverse-depth and
+        // world point backends; smart requires incremental.
+
+        // FEJ scope is a CALLER policy — the smoother is symbol-agnostic. Translate
+        // the config string into a key predicate over our own symbol convention:
+        // "xv" (default) = the states carrying the VI unobservable directions (global
+        // position + yaw); "xvb" adds biases (observable and drifting, so freezing
+        // them costs linearization quality for no consistency gain); "all" adds
+        // landmarks. Empty predicate would mean "all keys", so build it explicitly.
+        const std::string scope = params_.kf_fej_scope;
+        KeyframeSmoother::FejKeyFilter fej_filter =
+            [scope](gtsam::Key k) {
+                if (scope == "all") return true;
+                const unsigned char c = gtsam::Symbol(k).chr();
+                if (scope == "xvb") return c == 'x' || c == 'v' || c == 'b';
+                return c == 'x' || c == 'v';
+            };
+
+        const bool kf_use_gn = (params_.kf_optimizer == "gn");
+        // Solve-guard: only LANDMARKS may be dropped when the window's linear system goes
+        // indeterminate. A pose/velocity/bias degeneracy is a real failure and must NOT be
+        // masked, so the predicate excludes them — the guard rethrows in that case.
+        KeyframeSmoother::CullKeyFilter cull_filter =
+            [](gtsam::Key k) { return gtsam::Symbol(k).chr() == 'l'; };
+        // S1 lever: square-root (QR) vs normal-equation (Cholesky) Schur marginalization.
+        const bool kf_qr_marg = (params_.kf_marg_elim == "qr");
+        if (params_.kf_marg_elim != "qr" && params_.kf_marg_elim != "cholesky")
+            std::cerr << "[VIO Backend] WARNING: kf_marg_elim='" << params_.kf_marg_elim
+                      << "' unknown; falling back to cholesky.\n";
+        kf_smoother_ = std::make_unique<KeyframeSmoother>(params_.kf_window_size,
+                                                          params_.kf_use_fej,
+                                                          std::move(fej_filter),
+                                                          params_.kf_max_iterations,
+                                                          kf_use_gn,
+                                                          std::move(cull_filter),
+                                                          kf_qr_marg);
+        if (params_.kf_diag_cond) {
+            kf_smoother_->setCondDiagnostics(true);
+            std::cout << "[VIO Backend] S2 conditioning diagnostic ON — dense SVD per "
+                         "marginalization; this run's timing is NOT Pareto-comparable.\n";
+        }
+        std::cout << "[VIO Backend] smoother = KeyframeSmoother (standalone, keyframe window N_kf="
+                  << params_.kf_window_size
+                  << ", FEJ=" << (params_.kf_use_fej ? "on" : "off")
+                  << ", scope=" << params_.kf_fej_scope
+                  << ", opt=" << (kf_use_gn ? "GN" : "LM")
+                  << ", marg=" << (kf_qr_marg ? "QR" : "Cholesky") << ")\n";
+        if (params_.point_backend == "smart")
+            std::cerr << "[VIO Backend] WARNING: point_backend=smart needs backend_mode="
+                         "incremental; keyframe smoother stays on inverse-depth.\n";
     } else {
         throw std::invalid_argument("[VIO Backend] backend_mode='" + params_.backend_mode +
-                                    "' unknown (incremental is the only backend)");
+                                    "' unknown (incremental | keyframe; batch was removed)");
     }
     // Echo the window actually built, so a campaign can grep back that its config took.
     if (smoother_)
@@ -209,17 +275,30 @@ static double parallax_angle_deg(const gtsam::Point3& Pw,
     return std::acos(c) * 180.0 / M_PI;
 }
 
-// Solver calls. Every stamp written by initialize*/add_frame is win_coord() = the
-// KEYFRAME INDEX (see the ts[...] = w sites): states are stamped once at creation and
-// age out by index, landmarks are re-stamped on every observation and leave by
-// inactivity.
+// Backend dispatch. KeyframeSmoother owns a keyframe-indexed window; incremental is
+// a gtsam::FixedLagSmoother over the same keyframe index. Exactly one of
+// {kf_smoother_, smoother_} is active.
+//
+// Both consume the SAME per-key stamp map: every stamp written by
+// initialize*/add_frame is win_coord() = the KEYFRAME INDEX
+// (see the ts[...] = w sites), so the conversion below is exact, not a
+// reinterpretation. That is what lets the smoother stay symbol-agnostic: the caller
+// already encodes "stamp once at creation" for states and "re-stamp on every
+// observation" for landmarks, which is precisely the eviction policy each needs.
 void VioBackend::run_update(const gtsam::NonlinearFactorGraph& g, const gtsam::Values& v,
                             const gtsam::FixedLagSmoother::KeyTimestampMap& ts) {
-    smoother_->update(g, v, ts);
+    if (kf_smoother_) {
+        KeyframeSmoother::KeyIndexMap idx;
+        for (const auto& kv : ts)
+            idx[kv.first] = static_cast<std::uint64_t>(kv.second);
+        kf_smoother_->update(g, v, idx);
+    } else {
+        smoother_->update(g, v, ts);
+    }
 }
 
 gtsam::Values VioBackend::run_estimate() const {
-    return smoother_->calculateEstimate();
+    return kf_smoother_ ? kf_smoother_->calculateEstimate() : smoother_->calculateEstimate();
 }
 
 void VioBackend::initialize(const Eigen::Matrix4d& T_wb,
@@ -248,7 +327,7 @@ void VioBackend::initialize(const Eigen::Matrix4d& T_wb,
     graph_.addPrior(V(state_idx_), gtsam::Vector3(vel_w), prior_vel);
     graph_.addPrior(B(state_idx_), bias, prior_bias);
 
-    // Windowing coordinate: the keyframe index.
+    // Windowing coordinate: keyframe index in kf_fej (Phase 2b), else time.
     const double w = win_coord(state_idx_);
     gtsam::FixedLagSmoother::KeyTimestampMap ts;
     ts[X(state_idx_)] = w;
@@ -307,7 +386,7 @@ void VioBackend::initialize_window(const std::vector<Eigen::Matrix4d>& T_wb,
         initial_estimates_.insert(X(k), pose);
         initial_estimates_.insert(V(k), gtsam::Vector3(vels[k]));
         initial_estimates_.insert(B(k), bias0);
-        const double w_k = win_coord(k);   // keyframe index
+        const double w_k = win_coord(k);   // KF index in kf_fej, else time
         ts[X(k)] = ts[V(k)] = ts[B(k)] = w_k;
         state_time_[k] = w_k;
     }
@@ -496,6 +575,8 @@ bool VioBackend::get_pose_covariance(int idx, Eigen::Matrix<double, 6, 6>& out) 
     try {
         if (isam_view_) {
             out = isam_view_->marginalCovariance(X(idx));
+        } else if (kf_smoother_) {
+            out = kf_smoother_->marginalCovariance(X(idx));
         } else {
             return false;
         }
@@ -514,7 +595,9 @@ bool VioBackend::get_relative_pose_covariance(int ia, int ib,
     const gtsam::KeyVector keys{X(ia), X(ib)};
     try {
         gtsam::Matrix J12;   // 12x12 joint, block order [ia, ib]
-        if (isam_view_) {
+        if (kf_smoother_) {
+            J12 = kf_smoother_->jointMarginalCovariance(keys);
+        } else if (isam_view_) {
             gtsam::Marginals marg(isam_view_->getFactors(),
                                   isam_view_->getLinearizationPoint());
             gtsam::JointMarginal jm = marg.jointMarginalCovariance(keys);

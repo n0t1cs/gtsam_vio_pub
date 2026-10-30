@@ -33,6 +33,12 @@ VioParams VioParams::load(const std::string& path) {
     rd(rt, "deterministic",   p.deterministic);
     rd(rt, "rng_seed",        p.rng_seed);
     rd(rt, "kf_window_size", p.kf_window_size);
+    rd(rt, "kf_use_fej",     p.kf_use_fej);
+    rd(rt, "kf_fej_scope",   p.kf_fej_scope);
+    rd(rt, "kf_max_iterations", p.kf_max_iterations);
+    rd(rt, "kf_optimizer",   p.kf_optimizer);
+    rd(rt, "kf_marg_elim",   p.kf_marg_elim);
+    rd(rt, "kf_diag_cond",   p.kf_diag_cond);
     rd(rt, "loop_closure",   p.loop_closure);
     rd(rt, "frontend_source", p.frontend_source);
     rd(rt, "frontend_dir",    p.frontend_dir);
@@ -184,10 +190,11 @@ VioParams VioParams::load(const std::string& path) {
     rd(zu, "disp_px",   p.zupt_disp_px);
     rd(zu, "vel_sigma", p.zupt_vel_sigma);
 
-    // Only iSAM2 on the keyframe window exists in this release. Unknown keys are otherwise
-    // ignored, so a config that asked for another backend or a time window would silently
-    // run as something else. Reject it instead. Accepted on purpose: window_coord: keyframe,
-    // and smoother_lag_s next to it.
+    // The batch backend and the time window were removed on 2026-10-08. Unknown keys
+    // are otherwise ignored, so a config that relied on either would silently run as
+    // something else. Reject it instead. Accepted on purpose: window_coord: keyframe
+    // (now the only window), and smoother_lag_s in a config that never used it (the
+    // SLKS ignored it, and so did iSAM2 under window_coord: keyframe).
     {
         const YAML::Node& crt = rt;   // const access: never inserts keys
         std::string wc;
@@ -195,15 +202,16 @@ VioParams VioParams::load(const std::string& path) {
         const bool has_wc  = crt && crt["window_coord"];
         const bool has_lag = crt && crt["smoother_lag_s"];
         std::string why;
-        if (p.backend_mode != "incremental")
-            why = "backend_mode: " + p.backend_mode + " is not available (incremental is the only backend)";
+        if (p.backend_mode == "batch")
+            why = "backend_mode: batch (BatchFixedLagSmoother) was removed";
         else if (has_wc && wc != "keyframe")
-            why = "window_coord: " + wc + " is not available (every window is keyframe-indexed)";
-        else if (has_lag && !has_wc)
-            why = "this config sets smoother_lag_s without window_coord: keyframe, "
-                  "which means a time window";
+            why = "window_coord: " + wc + " was removed (every window is keyframe-indexed)";
+        else if (p.backend_mode == "incremental" && has_lag && !has_wc)
+            why = "this incremental config sets smoother_lag_s without window_coord: keyframe, "
+                  "which meant the removed time window";
         if (!why.empty()) {
-            std::cerr << "[params] FATAL in '" << path << "': " << why << ".\n";
+            std::cerr << "[params] FATAL in '" << path << "': " << why
+                      << ". The option is not part of this release.\n";
             std::exit(2);
         }
     }

@@ -13,6 +13,7 @@
 #include <gtsam/slam/ProjectionFactor.h>
 #include <gtsam/slam/SmartProjectionPoseFactor.h>
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
+#include "keyframe_smoother.h"
 
 #include <cstdint>
 #include <map>
@@ -30,6 +31,13 @@ public:
                const Eigen::Matrix4d& T_BC,
                boost::shared_ptr<gtsam::PreintegrationCombinedParams> imu_params,
                const VioParams& params);
+
+    // Per-marginalization conditioning log from the KeyframeSmoother.
+    // Empty unless runtime.kf_diag_cond was set and backend_mode=keyframe.
+    const std::vector<KeyframeSmoother::CondDiag>& kf_cond_log() const {
+        static const std::vector<KeyframeSmoother::CondDiag> kEmpty;
+        return kf_smoother_ ? kf_smoother_->condLog() : kEmpty;
+    }
 
     void initialize(const Eigen::Matrix4d& T_wb,
                     const Eigen::Vector3d& vel_w,
@@ -173,8 +181,12 @@ private:
     gtsam::SmartProjectionParams smart_params_;
     gtsam::SharedNoiseModel      smart_noise_;     // MUST be isotropic (SmartFactorBase requirement)
     gtsam::IncrementalFixedLagSmoother* isam_view_ = nullptr;  // non-owning view of smoother_ for getISAM2Result()
+    // KeyframeSmoother is STANDALONE (not a gtsam::FixedLagSmoother), so it is owned
+    // separately from smoother_. Exactly one of {smoother_, kf_smoother_} is non-null.
+    std::unique_ptr<KeyframeSmoother> kf_smoother_;           // owning (backend_mode: kf_fej|keyframe)
 
-    // Solver calls (iSAM2 through the FixedLagSmoother interface).
+    // Backend dispatch: run the active solver. keyframe uses the standalone smoother
+    // (own window + marginalization, keyframe indices); incremental uses smoother_.
     void          run_update(const gtsam::NonlinearFactorGraph& g, const gtsam::Values& v,
                              const gtsam::FixedLagSmoother::KeyTimestampMap& ts);
     gtsam::Values run_estimate() const;

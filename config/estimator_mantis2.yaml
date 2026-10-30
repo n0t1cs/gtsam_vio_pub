@@ -8,8 +8,12 @@
 # focal about 389 px.
 #
 # The settings that matter most:
-#   runtime         backend_mode incremental (iSAM2, the only backend), a 10-keyframe window,
-#                   Cholesky factorisation, deterministic (TBB pinned to one thread).
+#   runtime         backend_mode incremental (iSAM2, the default) or keyframe (the SLKS), both on
+#                   the same 10-keyframe window (kf_window_size), deterministic (TBB pinned to one
+#                   thread). iSAM2: Cholesky factorisation (isam_factorization), relinearisation
+#                   threshold and skip (isam_relin_*). The SLKS: first-estimates Jacobians at the
+#                   marginalisation boundary (kf_use_fej) on poses and velocities (kf_fej_scope xv),
+#                   one Gauss-Newton linearisation per keyframe (kf_max_iterations 1, kf_optimizer gn).
 #   imu_noise       white noise from the in-flight noise floor of the filtered stream, random walk
 #                   from a 24 h Allan fit of the same IMU. Recalibrate them for another vehicle.
 #   point_frontend  global histogram equalisation, 150 points on a 1x1 grid.
@@ -35,6 +39,10 @@ runtime:
   frontend_root: Euroc_frontend_20HZ
   backend_mode: incremental
   kf_window_size: 10
+  kf_use_fej: true
+  kf_fej_scope: xv
+  kf_max_iterations: 1
+  kf_optimizer: gn
   point_backend: invdepth
   isam_relin_threshold: 0.0005
   isam_relin_skip: 1
