@@ -7,7 +7,11 @@
 # alternating with the seed, so neither warm-up order nor thermal drift favours one backend.
 #
 #   bash scripts/run_board_campaign.sh [--out DIR] [--logs "MH_01_easy ..."] [--seeds "0 1 2 3 4"]
-#                                      [--backends "incremental keyframe"] [--cooldown S] [--dry-run]
+#                                      [--backends "incremental keyframe"] [--cooldown S]
+#                                      [--opencv-threads N] [--dry-run]
+#
+# --opencv-threads N sets the server's opencv_threads (0 = OpenCV runs in the calling thread), so a
+# stage's wall time in frames.csv is also its CPU time. Without it the config's value is kept.
 #
 # Two kinds of log, told apart by name, each run with its own configuration:
 #   EuRoC   MH_* V1_* V2_*  /data/logs/euroc/<seq>/ (a EuRoC sequence written in the voxl-logger layout,
@@ -65,6 +69,7 @@ LOG_LIST="MH_01_easy MH_02_easy MH_03_medium MH_04_difficult MH_05_difficult V1_
 SEEDS="0 1 2 3 4"
 BACKENDS="incremental keyframe"
 COOLDOWN=20
+OCV=""              # --opencv-threads, empty = the server config's value
 REPLAY_TIMEOUT=900   # s, five times the longest log
 DRY=0
 SVCS="voxl-camera-server voxl-imu-server voxl-qvio-server voxl-open-vins-server"
@@ -76,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --seeds) SEEDS="$2"; shift 2 ;;
     --backends) BACKENDS="$2"; shift 2 ;;
     --cooldown) COOLDOWN="$2"; shift 2 ;;
+    --opencv-threads) OCV="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,/^# =====/p' "$0"; exit 0 ;;
     *) echo "ERROR: unknown option $1" >&2; exit 2 ;;
@@ -117,6 +123,7 @@ for l in $LOG_LIST; do
   [[ $(grep -cE '^  backend_mode: incremental( .*)?$' "$e") -eq 1 ]] || die "$e: expected one '  backend_mode: incremental' line"
 done
 for b in $BACKENDS; do [[ $b == incremental || $b == keyframe ]] || die "unknown backend $b"; done
+[[ -z $OCV || $OCV =~ ^-?[0-9]+$ ]] || die "--opencv-threads needs an integer"
 tag() { [[ $1 == keyframe ]] && echo slks || echo isam2; }
 mkdir -p "$OUT"
 
@@ -134,6 +141,11 @@ make_cfgs() {
       -e "s#^intrinsics_file:.*#intrinsics_file: $L/data/modalai/opencv_tracking_front_intrinsics.yml#" \
       -e "s#^extrinsics_file:.*#extrinsics_file: $L/etc/modalai/extrinsics.conf#" \
       -e "s#^log_dir:.*#log_dir: $d/srv#" "$S" > "$d/server.yaml"
+  if [[ -n $OCV ]]; then
+    if grep -q '^opencv_threads:' "$d/server.yaml"; then sed -i "s/^opencv_threads:.*/opencv_threads: $OCV/" "$d/server.yaml"
+    else echo "opencv_threads: $OCV" >> "$d/server.yaml"; fi
+    [[ $(grep -c "^opencv_threads: $OCV\$" "$d/server.yaml") -eq 1 ]] || return 1
+  fi
   # each rewrite landed exactly once, nothing else differs (estimator: the seed line added or replaced,
   # plus the backend line when it changed or lost its comment, server: only the four keys, which the
   # template may already hold, as the EuRoC template does for MH_01_easy's calibration)
@@ -141,7 +153,7 @@ make_cfgs() {
   [[ $(grep -c "^  backend_mode: $b\$" "$d/estimator.yaml") -eq 1 ]] || return 1
   local n v; n=$(diff "$E" "$d/estimator.yaml" | grep -c '^[<>]')
   [[ $n -ge 1 && $n -le 4 ]] || return 1
-  [[ $(diff "$S" "$d/server.yaml" | grep '^[<>]' | grep -cvE '^[<>] (estimator_config|intrinsics_file|extrinsics_file|log_dir): ') -eq 0 ]] || return 1
+  [[ $(diff "$S" "$d/server.yaml" | grep '^[<>]' | grep -cvE '^[<>] (estimator_config|intrinsics_file|extrinsics_file|log_dir|opencv_threads): ') -eq 0 ]] || return 1
   for v in "estimator_config: $d/estimator.yaml" "intrinsics_file: $L/data/modalai/opencv_tracking_front_intrinsics.yml" \
            "extrinsics_file: $L/etc/modalai/extrinsics.conf" "log_dir: $d/srv"; do
     [[ $(grep -cxF "$v" "$d/server.yaml") -eq 1 ]] || return 1
@@ -240,7 +252,7 @@ if [[ $DRY -eq 0 ]]; then
     echo "governor $(sort /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | uniq -c | xargs)"
     echo "clk_tck $(getconf CLK_TCK)"
     echo "kernel $(uname -r), $(nproc) cores, $(free -m | awk '/^Mem/ {print $2}') MB"
-    echo "logs $LOG_LIST | seeds $SEEDS | backends $BACKENDS | cooldown $COOLDOWN s"
+    echo "logs $LOG_LIST | seeds $SEEDS | backends $BACKENDS | cooldown $COOLDOWN s | opencv_threads ${OCV:-as in the server config}"
     echo "warm after each drop: $(wc -w <<< "$WARM") files ($(cat $WARM | wc -c) bytes), the server, voxl-replay and their libraries"
     echo "per run: drop_caches 3 and compact_memory before the server starts, up to 3 attempts after an infrastructure failure (failed attempts in ${FAILED})"
   } >> "$OUT/campaign.txt"

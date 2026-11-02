@@ -1,6 +1,7 @@
 #include "frontend.h"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 
 namespace vio {
@@ -40,14 +41,29 @@ FeatureTracker::FeatureTracker(const CamCalib& calib, int max_pts, int min_dist,
 }
 
 Observation FeatureTracker::step(const cv::Mat& img_in, const Eigen::Matrix3d& dR_body) {
+    // Stage times for the cost study: lap() returns the wall time since the previous lap.
+    cost_ = FrontendCost();
+    auto t_lap = std::chrono::steady_clock::now();
+    auto lap = [&t_lap]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t_lap).count();
+        t_lap = now;
+        return ms;
+    };
+
     cv::Mat img = ensure_gray_uint8(img_in);
     if (histeq_ == 1)      cv::equalizeHist(img, img);   // global (OpenVINS EuRoC)
     else if (clahe_)       clahe_->apply(img, img);      // CLAHE (adaptive)
+    cost_.clahe = lap();
 
     if (prev_img_.empty()) {
         detect_new(img);
+        cost_.detect = lap();
         prev_img_ = img.clone();
-        return make_observation();
+        cost_.copy = lap();
+        Observation o = make_observation();
+        cost_.obs = lap();
+        return o;
     }
 
     // ---- 1) KLT forward-backward ------------------------------------------
@@ -58,8 +74,12 @@ Observation FeatureTracker::step(const cv::Mat& img_in, const Eigen::Matrix3d& d
     if (prev_pts_.empty()) {
         // Nothing to track; just (re-)detect.
         prev_img_ = img.clone();
+        cost_.copy = lap();
         detect_new(img);
-        return make_observation();
+        cost_.detect = lap();
+        Observation o = make_observation();
+        cost_.obs = lap();
+        return o;
     }
 
     // ---- IMU-aided prediction: seed the KLT search by rotating the prior points by the
@@ -94,12 +114,15 @@ Observation FeatureTracker::step(const cv::Mat& img_in, const Eigen::Matrix3d& d
         for (size_t i = 0; i < pred.size(); ++i)
             if (rays[i].z > 1e-6f) next_pts[i] = pred[i];   // keep prev seed if behind cam
     }
+    cost_.predict = lap();
 
     cv::calcOpticalFlowPyrLK(prev_img_, img, prev_pts_, next_pts, status, err,
                              klt_win_, klt_max_level_, klt_crit_,
                              use_pred ? cv::OPTFLOW_USE_INITIAL_FLOW : 0);
+    cost_.klt_fwd = lap();
     cv::calcOpticalFlowPyrLK(img, prev_img_, next_pts, back_pts, status_b, err_b,
                              klt_win_, klt_max_level_, klt_crit_);
+    cost_.klt_bwd = lap();
 
     std::vector<unsigned char> good(prev_pts_.size(), 0);
     fb_last_.clear();   // id -> this-frame FB residual, for heteroscedastic reprojection cov
@@ -184,14 +207,19 @@ Observation FeatureTracker::step(const cv::Mat& img_in, const Eigen::Matrix3d& d
     // ---- 4) Commit and bump track ages ------------------------------------
     prev_pts_ = cur_pts;
     for (auto& c : track_cnt_) c++;
+    cost_.reject = lap();
 
     // ---- 5) Refill --------------------------------------------------------
     if ((int)prev_pts_.size() < max_pts_) {
         detect_new(img);
     }
+    cost_.detect = lap();
 
     prev_img_ = img.clone();
-    return make_observation();
+    cost_.copy = lap();
+    Observation o = make_observation();
+    cost_.obs = lap();
+    return o;
 }
 
 void FeatureTracker::detect_new(const cv::Mat& img) {

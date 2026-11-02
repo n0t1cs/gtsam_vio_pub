@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <time.h>
 
 namespace vio {
 
@@ -64,6 +65,21 @@ struct Observation {
     // covariance -- high on hard/fast-rotation tracking, low on clean corners.
     std::vector<double> fb_res;
 };
+
+// Cost study: the tracker's stage times for one frame [ms, wall], filled by FeatureTracker::step,
+// and the front-end thread's CPU clock when it finished the frame [ms]. Logged with the frame,
+// never read by the estimator.
+struct FrontendCost {
+    double clahe = 0, predict = 0, klt_fwd = 0, klt_bwd = 0, reject = 0, detect = 0, copy = 0, obs = 0;
+    double thread_cpu_ms = 0;
+};
+
+// CPU time consumed by the calling thread so far [ms].
+inline double thread_cpu_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
 
 // One keyframe in the SfM init buffer.
 struct KeyframeEntry {

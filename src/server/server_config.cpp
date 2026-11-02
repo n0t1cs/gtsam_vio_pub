@@ -39,6 +39,7 @@ ServerConfig ServerConfig::load(const std::string& path) {
     rd(r, "output_pipe", c.output_pipe);
     rd(r, "output_pipe_extended", c.output_pipe_extended);
     rd(r, "soft_reset_keeps_frame", c.soft_reset_keeps_frame);
+    rd(r, "opencv_threads", c.opencv_threads);
     const YAML::Node rt = r["realtime"];
     rd(rt, "max_pending_frames", c.max_pending_frames);
     rd(rt, "imu_wait_timeout_s", c.imu_wait_timeout_s);
@@ -68,7 +69,7 @@ std::string ServerConfig::summary() const {
       << "imu_lowpass " << (imu_lowpass ? "on" : "off") << " order " << imu_lowpass_order << " cutoff "
       << imu_lowpass_cutoff_hz << " Hz, camera_time_offset_ns " << camera_time_offset_ns << "\n"
       << "output " << output_pipe << " + " << output_pipe_extended << ", auto_reset "
-      << (auto_reset ? "on" : "off") << ", log_dir '" << log_dir << "'";
+      << (auto_reset ? "on" : "off") << ", log_dir '" << log_dir << "', opencv_threads " << opencv_threads;
     return s.str();
 }
 

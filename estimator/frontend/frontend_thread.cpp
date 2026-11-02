@@ -79,6 +79,8 @@ void FrontendThread::run() {
         so.obs  = tracker_.step(si.img, dR_body);    // IMU-aided KLT
         track_ms_.push_back(1e3 * std::chrono::duration<double>(
                                       std::chrono::steady_clock::now() - _t0).count());
+        so.cost = tracker_.last_cost();              // stage times, and this thread's CPU clock
+        so.cost.thread_cpu_ms = thread_cpu_ms();
         out_.push(std::move(so));
         prev_t_ns_ = si.t_ns;
         n_.fetch_add(1, std::memory_order_relaxed);

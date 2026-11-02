@@ -35,6 +35,10 @@ struct ServerConfig {
     std::string output_pipe_extended = "gvio_extended";   // ext_vio_data_t
     bool soft_reset_keeps_frame = true;      // after an automatic reset, continue the published frame
 
+    // OpenCV's worker threads (cv::setNumThreads): -1 = OpenCV's default, 0 = none (every OpenCV
+    // call runs in the thread that makes it), n = n workers. Same estimate either way.
+    int    opencv_threads = -1;
+
     // real time and health
     int    max_pending_frames = 3;
     double imu_wait_timeout_s = 0.3;

@@ -14,6 +14,7 @@
 #include "server_config.h"
 
 #include <modal_pipe.h>
+#include <opencv2/core.hpp>
 
 #include <chrono>
 #include <ctime>
@@ -79,6 +80,9 @@ int main(int argc, char** argv) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;
     }
+    if (sc.opencv_threads >= 0) cv::setNumThreads(sc.opencv_threads);
+    std::cout << "[opencv] " << cv::getNumThreads() << " worker threads ("
+              << (sc.opencv_threads >= 0 ? "opencv_threads" : "OpenCV's default") << ")\n";
     ec.imu_filter.enable = sc.imu_lowpass;
     ec.imu_filter.order = sc.imu_lowpass_order;
     ec.imu_filter.cutoff_hz = sc.imu_lowpass_cutoff_hz;

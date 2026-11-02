@@ -191,13 +191,15 @@ void VioEngine::sync_loop() {
             for (const auto& s : batch) est_imu_.push_back(s);
         }
         for (const auto& s : batch) fe_imu_q_.push(s);
-        {
-            std::lock_guard<std::mutex> lk(meta_m_);
-            meta_[f.t_ns] = FrameMeta{f.frame_id, f.entry};
-        }
         StampedImage si;
         si.t_ns = f.t_ns;
+        const auto t_remap = Clock::now();
         si.img = cfg_.undistort.apply(f.img);
+        const double remap_ms = ms_since(t_remap);
+        {
+            std::lock_guard<std::mutex> lk(meta_m_);
+            meta_[f.t_ns] = FrameMeta{f.frame_id, f.entry, remap_ms, vio::thread_cpu_ms()};
+        }
         img_q_.push(std::move(si));
     }
     img_q_.close();
@@ -220,6 +222,7 @@ void VioEngine::estimator_loop() {
 }
 
 void VioEngine::process(const StampedObservation& so) {
+    const auto t_proc = Clock::now();
     // IMU up to this frame (the sync thread queued it before the frame).
     {
         std::lock_guard<std::mutex> lk(est_imu_m_);
@@ -269,6 +272,11 @@ void VioEngine::process(const StampedObservation& so) {
     out.error_code |= input_err_.exchange(0) | sticky_err_;
     sticky_err_ = 0;
     out.latency_ms = ms_since(meta.entry);
+    out.remap_ms = meta.remap_ms;
+    out.sync_cpu_ms = meta.sync_cpu_ms;
+    out.fe = so.cost;
+    out.est_ms = ms_since(t_proc);
+    out.est_cpu_ms = vio::thread_cpu_ms();
     log_.frame(out);
     {
         std::lock_guard<std::mutex> lk(stats_m_);
@@ -423,15 +431,20 @@ void VioEngine::run_online(double t_s, const Observation& obs, EngineOutput& out
 
         const auto t_bk = Clock::now();
         const bool is_kf = backend_->add_frame(obs_dict, t_s, stationary);
+        out.add_frame_ms = ms_since(t_bk);
         if (is_kf) {
-            out.kf_update_ms = ms_since(t_bk);
+            out.kf_update_ms = out.add_frame_ms;
             out.is_keyframe = true;
             const Eigen::Matrix4d Twb = backend_->get_current_pose();
             log_.kf_pose(t_s, Twb);
+            const auto t_cov = Clock::now();
             push_cov(backend_->get_state_idx(), t_s, Twb, &out);
             if (P.dump_relcov) push_relcov(backend_->get_state_idx(), t_s);
+            out.cov_ms = ms_since(t_cov);
         }
+        const auto t_nav = Clock::now();
         const auto nav = backend_->get_nav_out();
+        out.nav_ms = ms_since(t_nav);
         if (!nav.ok) throw std::runtime_error("no navigation state");
         out.T_wb = nav.T_now; out.v_w = nav.v_now; out.bg = nav.bg; out.ba = nav.ba;
         out.w_body -= nav.bg;

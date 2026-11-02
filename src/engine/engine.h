@@ -106,6 +106,12 @@ struct EngineOutput {
     std::vector<std::pair<int64_t, Eigen::Vector2d>> features;           // id, pinhole pixel
     double latency_ms = 0.0;       // engine entry of the frame -> this output, wall clock
     double kf_update_ms = 0.0;     // add_frame time on a keyframe
+    // Cost study, wall [ms]: the remap (sync thread), the tracker's stages (front-end thread), the
+    // estimator thread's work on this frame up to its log row, and its parts. *_cpu_ms: a thread's
+    // CPU clock when it finished this frame (cumulative, the front-end's is in fe.thread_cpu_ms).
+    double remap_ms = 0.0, est_ms = 0.0, add_frame_ms = 0.0, cov_ms = 0.0, nav_ms = 0.0;
+    vio::FrontendCost fe;
+    double sync_cpu_ms = 0.0, est_cpu_ms = 0.0;
 };
 
 class VioEngine {
@@ -145,7 +151,11 @@ public:
 
 private:
     struct Pending { int64_t t_ns; int64_t frame_id; cv::Mat img; std::chrono::steady_clock::time_point entry; };
-    struct FrameMeta { int64_t frame_id; std::chrono::steady_clock::time_point entry; };
+    struct FrameMeta {
+        int64_t frame_id;
+        std::chrono::steady_clock::time_point entry;
+        double remap_ms = 0.0, sync_cpu_ms = 0.0;   // cost study (EngineOutput)
+    };
 
     void sync_loop();
     void estimator_loop();

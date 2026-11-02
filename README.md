@@ -162,7 +162,8 @@ voxl-inspect-vio gvio                               # the output, ModalAI's tool
 systemctl enable --now voxl-gtsam-vio-server        # only after the bench test
 ```
 
-Logs go to `/data/gvio/<start time>/`: `frames.csv` (every frame, with its latency), `events.log`,
+Logs go to `/data/gvio/<start time>/`: `frames.csv` (every frame, with its latency and its cost: the
+remap, the tracker's stages, the estimator's parts and each thread's CPU clock), `events.log`,
 `session<k>/vio_results_est.tum` and `vio_cov.csv` (keyframes, one session per reset), readable by
 `scripts/eval_online.py`.
 

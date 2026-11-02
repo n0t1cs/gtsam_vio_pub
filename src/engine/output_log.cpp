@@ -17,7 +17,10 @@ OutputLog::OutputLog(const std::string& dir) : dir_(dir) {
     events_.open(dir_ + "/events.log");
     frames_.open(dir_ + "/frames.csv");
     frames_ << "t_ns,frame_id,session,state,error_code,is_kf,n_features,px,py,pz,qw,qx,qy,qz,vx,vy,vz,"
-               "bgx,bgy,bgz,bax,bay,baz,latency_ms,kf_update_ms\n" << std::flush;
+               "bgx,bgy,bgz,bax,bay,baz,latency_ms,kf_update_ms,"
+               "remap_ms,fe_clahe_ms,fe_predict_ms,fe_klt_fwd_ms,fe_klt_bwd_ms,fe_reject_ms,fe_detect_ms,"
+               "fe_copy_ms,fe_obs_ms,est_ms,add_frame_ms,cov_ms,nav_ms,cpu_sync_ms,cpu_fe_ms,cpu_est_ms\n"
+            << std::flush;
 }
 
 void OutputLog::meta(const std::string& line) {
@@ -90,7 +93,12 @@ void OutputLog::frame(const EngineOutput& o) {
             << ',' << o.v_w.x() << ',' << o.v_w.y() << ',' << o.v_w.z()
             << ',' << o.bg.x() << ',' << o.bg.y() << ',' << o.bg.z()
             << ',' << o.ba.x() << ',' << o.ba.y() << ',' << o.ba.z()
-            << std::setprecision(4) << ',' << o.latency_ms << ',' << o.kf_update_ms << "\n" << std::flush;
+            << std::setprecision(4) << ',' << o.latency_ms << ',' << o.kf_update_ms
+            << ',' << o.remap_ms << ',' << o.fe.clahe << ',' << o.fe.predict << ',' << o.fe.klt_fwd
+            << ',' << o.fe.klt_bwd << ',' << o.fe.reject << ',' << o.fe.detect << ',' << o.fe.copy
+            << ',' << o.fe.obs << ',' << o.est_ms << ',' << o.add_frame_ms << ',' << o.cov_ms << ',' << o.nav_ms
+            << std::fixed << std::setprecision(3) << ',' << o.sync_cpu_ms << ',' << o.fe.thread_cpu_ms
+            << ',' << o.est_cpu_ms << std::defaultfloat << "\n" << std::flush;
 }
 
 } // namespace gvio

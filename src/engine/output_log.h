@@ -4,7 +4,9 @@
 //                                    offline convention), estimator world, TUM order
 //   session<k>/vio_cov.csv           per keyframe pose + 6x6 covariance (runtime.dump_covariance)
 //   session<k>/vio_relcov.csv        relative poses + covariance (runtime.dump_relcov)
-//   frames.csv                       every frame: absolute stamp, state, pose at that frame, latency
+//   frames.csv                       every frame: absolute stamp, state, pose at that frame, latency,
+//                                    and its cost: remap, tracker stages, estimator thread parts
+//                                    [ms], each thread's CPU clock (EngineOutput)
 //   events.log                       init, resets, drops, faults
 //   meta.txt                         t0_ns of the time base and the configuration in use
 // A session is one initialisation: a reset starts session k+1. Rows are flushed as they are

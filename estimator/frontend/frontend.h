@@ -41,6 +41,9 @@ public:
         perm_rng_.seed(static_cast<std::uint32_t>(perm_seed_));
     }
 
+    // Stage times of the last step() (cost study), thread_cpu_ms left at 0.
+    const FrontendCost& last_cost() const { return cost_; }
+
 private:
     // calibration (cached)
     cv::Mat K_cv_;
@@ -79,6 +82,7 @@ private:
     std::vector<int> track_cnt_;
     std::unordered_map<int64_t, double> fb_last_;   // id -> this-frame forward-backward residual [px]
     int64_t next_id_;
+    FrontendCost cost_;                             // stage times of the last step()
 
     // helpers
     void detect_new(const cv::Mat& img);

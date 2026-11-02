@@ -24,7 +24,7 @@ namespace vio {
 
 // Timestamped payloads on the thread edges (t_ns = the shared pipeline clock).
 struct StampedImage       { int64_t t_ns = 0; cv::Mat img; };
-struct StampedObservation { int64_t t_ns = 0; Observation obs; };
+struct StampedObservation { int64_t t_ns = 0; Observation obs; FrontendCost cost; };
 
 template <typename T>
 class ThreadSafeQueue {

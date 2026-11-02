@@ -28,6 +28,8 @@ output_pipe: gvio
 output_pipe_extended: gvio_extended
 soft_reset_keeps_frame: true             # an automatic reset continues the published frame
 
+opencv_threads: -1                       # OpenCV workers: -1 = OpenCV's default, 0 = none, n = n
+
 realtime:
   max_pending_frames: 3                  # frames waiting for IMU coverage, oldest dropped beyond
   imu_wait_timeout_s: 0.3

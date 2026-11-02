@@ -45,7 +45,7 @@ static void usage() {
         "usage: gvio-engine-replay (--dataset DIR | --voxl-log DIR) --config ESTIMATOR.yaml --out DIR\n"
         "         [--rate R] [--lpf on|off] [--cam NAME] [--intrinsics YML] [--extrinsics CONF]\n"
         "         [--balance B] [--pin-K fu,fv,cu,cv] [--imu-batch-ms MS] [--max-frames N]\n"
-        "         [--start-frame N] [--no-auto-reset]\n"
+        "         [--start-frame N] [--opencv-threads N] [--no-auto-reset]\n"
         "  defaults: --rate 0 (lockstep), --lpf off for --dataset and on for --voxl-log,\n"
         "            --cam tracking_front_misp_norm, intrinsics and extrinsics from the log itself\n";
 }
@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
     std::string dataset, voxl_log, config, out_dir, cam = "tracking_front_misp_norm", intr, extr, lpf, pin;
     double rate = 0.0, balance = 0.0, imu_batch_ms = 10.0;
-    long max_frames = -1, start_frame = 0;
+    long max_frames = -1, start_frame = 0, opencv_threads = -1;
     bool auto_reset = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
         else if (a == "--imu-batch-ms") imu_batch_ms = std::stod(next());
         else if (a == "--max-frames") max_frames = std::stol(next());
         else if (a == "--start-frame") start_frame = std::stol(next());
+        else if (a == "--opencv-threads") opencv_threads = std::stol(next());
         else if (a == "--no-auto-reset") auto_reset = false;
         else { usage(); return 2; }
     }
@@ -124,6 +125,8 @@ int main(int argc, char** argv) {
         std::cerr << "ERROR: --out " << out_dir << " exists and is not empty\n";
         return 2;
     }
+
+    if (opencv_threads >= 0) cv::setNumThreads((int)opencv_threads);   // as the server's opencv_threads
 
     gvio::EngineConfig cfg;
     cfg.P = vio::VioParams::load(config);
