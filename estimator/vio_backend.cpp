@@ -588,6 +588,27 @@ bool VioBackend::get_pose_covariance(int idx, Eigen::Matrix<double, 6, 6>& out) 
     return true;
 }
 
+// 12x12 joint of X(ia), X(ib), block order [ia, ib].
+static gtsam::Matrix joint12(const gtsam::Marginals& marg, int ia, int ib) {
+    gtsam::JointMarginal jm = marg.jointMarginalCovariance(gtsam::KeyVector{X(ia), X(ib)});
+    gtsam::Matrix J12(12, 12);
+    J12.block<6,6>(0,0) = jm.at(X(ia), X(ia));  J12.block<6,6>(0,6) = jm.at(X(ia), X(ib));
+    J12.block<6,6>(6,0) = jm.at(X(ib), X(ia));  J12.block<6,6>(6,6) = jm.at(X(ib), X(ib));
+    return J12;
+}
+
+// d(Ta^-1 Tb)/d(Ta), d(...)/d(Tb) -> J = [H1 H2] (6x12); Sigma_rel = J S J^T.
+static void between_covariance(const gtsam::Matrix& J12, const gtsam::Pose3& Ta, const gtsam::Pose3& Tb,
+                               Eigen::Matrix<double, 6, 6>& out) {
+    Eigen::Matrix<double, 6, 6> H1, H2;
+    Ta.between(Tb, H1, H2);
+    Eigen::Matrix<double, 6, 12> J;
+    J.block<6,6>(0,0) = H1;
+    J.block<6,6>(0,6) = H2;
+    out = J * J12 * J.transpose();
+    out = 0.5 * (out + out.transpose());   // re-symmetrize against round-off
+}
+
 bool VioBackend::get_relative_pose_covariance(int ia, int ib,
                                               Eigen::Matrix<double, 6, 6>& out) const {
     if (ia == ib) return false;
@@ -598,25 +619,57 @@ bool VioBackend::get_relative_pose_covariance(int ia, int ib,
         if (kf_smoother_) {
             J12 = kf_smoother_->jointMarginalCovariance(keys);
         } else if (isam_view_) {
-            gtsam::Marginals marg(isam_view_->getFactors(),
-                                  isam_view_->getLinearizationPoint());
-            gtsam::JointMarginal jm = marg.jointMarginalCovariance(keys);
-            J12.resize(12, 12);
-            J12.block<6,6>(0,0) = jm.at(X(ia), X(ia));  J12.block<6,6>(0,6) = jm.at(X(ia), X(ib));
-            J12.block<6,6>(6,0) = jm.at(X(ib), X(ia));  J12.block<6,6>(6,6) = jm.at(X(ib), X(ib));
+            J12 = joint12(gtsam::Marginals(isam_view_->getFactors(), isam_view_->getLinearizationPoint()), ia, ib);
         } else {
             return false;
         }
-        // d(Ta^-1 Tb)/d(Ta), d(...)/d(Tb) -> J = [H1 H2] (6x12); Sigma_rel = J S J^T.
-        const gtsam::Pose3 Ta = latest_estimate_.at<gtsam::Pose3>(X(ia));
-        const gtsam::Pose3 Tb = latest_estimate_.at<gtsam::Pose3>(X(ib));
-        Eigen::Matrix<double, 6, 6> H1, H2;
-        Ta.between(Tb, H1, H2);
-        Eigen::Matrix<double, 6, 12> J;
-        J.block<6,6>(0,0) = H1;
-        J.block<6,6>(0,6) = H2;
-        out = J * J12 * J.transpose();
-        out = 0.5 * (out + out.transpose());   // re-symmetrize against round-off
+        between_covariance(J12, latest_estimate_.at<gtsam::Pose3>(X(ia)),
+                           latest_estimate_.at<gtsam::Pose3>(X(ib)), out);
+    } catch (const std::exception& e) {
+        static int n = 0;
+        if (n++ < 3) std::cerr << "[cov] jointMarginalCovariance(X(" << ia << "),X(" << ib
+                               << ")) failed: " << e.what() << "\n";
+        return false;
+    }
+    return out.allFinite();
+}
+
+bool VioBackend::covariance_snapshot(CovSnapshot& s) const {
+    if (smart_mode_) return false;
+    if (isam_view_) {
+        s.graph = isam_view_->getFactors();
+        s.theta = isam_view_->getLinearizationPoint();
+    } else if (kf_smoother_) {
+        s.graph = kf_smoother_->getFactors();
+        s.theta = kf_smoother_->getLinearizationPoint();
+    } else {
+        return false;
+    }
+    s.poses.clear();
+    for (const auto kv : latest_estimate_)
+        if (gtsam::Symbol(kv.key).chr() == 'x') s.poses.insert(kv.key, kv.value);
+    return true;
+}
+
+bool VioBackend::pose_covariance(const CovSnapshot& s, const gtsam::Marginals& m, int idx,
+                                 Eigen::Matrix<double, 6, 6>& out) {
+    if (!s.poses.exists(X(idx))) return false;
+    try {
+        out = m.marginalCovariance(X(idx));
+    } catch (const std::exception& e) {
+        static int n = 0;
+        if (n++ < 3) std::cerr << "[cov] marginalCovariance(X(" << idx << ")) failed: " << e.what() << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool VioBackend::relative_pose_covariance(const CovSnapshot& s, const gtsam::Marginals& m, int ia, int ib,
+                                          Eigen::Matrix<double, 6, 6>& out) {
+    if (ia == ib) return false;
+    if (!s.poses.exists(X(ia)) || !s.poses.exists(X(ib))) return false;
+    try {
+        between_covariance(joint12(m, ia, ib), s.poses.at<gtsam::Pose3>(X(ia)), s.poses.at<gtsam::Pose3>(X(ib)), out);
     } catch (const std::exception& e) {
         static int n = 0;
         if (n++ < 3) std::cerr << "[cov] jointMarginalCovariance(X(" << ia << "),X(" << ib
@@ -1416,8 +1469,8 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
     //     S = H_obs P- H_obs^T + sigma_px^2 I -- POSE-ONLY innovation covariance (anchor and
     //     inverse-depth uncertainty omitted -> S understated -> NIS_A biased high). P- is the
     //     previous pose marginal propagated through the IMU relative motion (EKF predict).
-    //     invdepth mode only (smart/world excluded); gated on dump_covariance.
-    if (params_.dump_covariance && !smart_mode_ && !world_mode_) {
+    //     invdepth mode only (smart/world excluded); gated on dump_covariance and nis_prefit.
+    if (params_.dump_covariance && params_.nis_prefit && !smart_mode_ && !world_mode_) {
         Eigen::Matrix<double, 6, 6> P_prev;
         if (get_pose_covariance(prev_idx, P_prev)) {
             const gtsam::Pose3 T_prev = current.at<gtsam::Pose3>(X(prev_idx));

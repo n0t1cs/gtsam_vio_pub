@@ -26,6 +26,8 @@ namespace gvio {
 using namespace vio;
 using Clock = std::chrono::steady_clock;
 
+static constexpr int kCovQueue = 4;   // covariance jobs waiting (one per keyframe)
+
 static double ms_since(Clock::time_point t0) {
     return 1e3 * std::chrono::duration<double>(Clock::now() - t0).count();
 }
@@ -56,7 +58,8 @@ VioEngine::VioEngine(EngineConfig cfg)
     t << "T_BC " << cfg_.calib.T_BC.row(0) << " | " << cfg_.calib.T_BC.row(1) << " | " << cfg_.calib.T_BC.row(2);
     log_.meta(t.str());
     log_.meta(std::string("imu_filter ") + (cfg_.imu_filter.enable ? "on" : "off") + " lockstep "
-              + (cfg_.lockstep ? "on" : "off") + " auto_reset " + (cfg_.auto_reset ? "on" : "off"));
+              + (cfg_.lockstep ? "on" : "off") + " auto_reset " + (cfg_.auto_reset ? "on" : "off")
+              + " covariance " + (cfg_.async_covariance ? "async" : "inline"));
 }
 
 VioEngine::~VioEngine() { stop(); }
@@ -85,6 +88,10 @@ void VioEngine::start() {
     frontend_ = std::make_unique<FrontendThread>(data_.cam_calib, fp, img_q_, obs_q_,
                                                  P.pt_imu_aided_klt ? &fe_imu_q_ : nullptr);
     frontend_->start();
+    if (cfg_.async_covariance) {
+        log_.open_cov_jobs();
+        cov_th_ = std::thread(&VioEngine::cov_loop, this);
+    }
     sync_th_ = std::thread(&VioEngine::sync_loop, this);
     est_th_  = std::thread(&VioEngine::estimator_loop, this);
 }
@@ -223,6 +230,7 @@ void VioEngine::estimator_loop() {
 
 void VioEngine::process(const StampedObservation& so) {
     const auto t_proc = Clock::now();
+    frame_t_ns_ = so.t_ns;
     // IMU up to this frame (the sync thread queued it before the frame).
     {
         std::lock_guard<std::mutex> lk(est_imu_m_);
@@ -269,6 +277,7 @@ void VioEngine::process(const StampedObservation& so) {
     prev_obs_ = so.obs;
     out.session = session_;
     out.session_hard = session_hard_;
+    if (cfg_.async_covariance) take_cov(out);
     out.error_code |= input_err_.exchange(0) | sticky_err_;
     sticky_err_ = 0;
     out.latency_ms = ms_since(meta.entry);
@@ -360,21 +369,28 @@ void VioEngine::start_backend(AlignedInit& aligned) {
     backend_->initialize_window(aligned.T_wb, aligned.velocities, aligned.sfm.frames,
                                 aligned.sfm.points, aligned.b_g, aligned.b_a, data_.imu, t0_ns_);
     // The init-window block of the trajectory, exactly as main.cpp writes it: the backend's poses
-    // right after initialize_window, and their covariance when runtime.dump_covariance.
+    // right after initialize_window, and their covariance when runtime.dump_covariance (async:
+    // one job, so one factorization for the whole window).
+    cov_async_ = cfg_.async_covariance && backend_->can_snapshot();
     const bool iw_in_smoother = P.init_continuous_window;
+    CovJob iw;
     for (size_t k = 0; k < aligned.sfm.frames.size(); ++k) {
         Eigen::Matrix4d refined;
         const Eigen::Matrix4d T = (iw_in_smoother && backend_->get_pose_at((int)k, refined))
                                       ? refined : aligned.T_wb[k];
         log_.kf_pose(aligned.sfm.frames[k].t, T);
         if (iw_in_smoother) {
-            push_cov((int)k, aligned.sfm.frames[k].t, T, nullptr);
+            if (cov_async_ && P.dump_covariance && !backend_->cheap_pose_covariance())
+                iw.poses.push_back({(int)k, aligned.sfm.frames[k].t, T});
+            else
+                push_cov((int)k, aligned.sfm.frames[k].t, T, nullptr);
         } else if (P.dump_covariance) {
             Eigen::Matrix<double, 6, 6> C;
             C.setConstant(std::numeric_limits<double>::quiet_NaN());
             log_.kf_cov(aligned.sfm.frames[k].t, T, C);
         }
     }
+    post_cov(std::move(iw));
     prev_t_s_ = aligned.sfm.frames.back().t;
     kf_hist_.clear();
     low_feat_since_s_ = -1.0;
@@ -438,8 +454,7 @@ void VioEngine::run_online(double t_s, const Observation& obs, EngineOutput& out
             const Eigen::Matrix4d Twb = backend_->get_current_pose();
             log_.kf_pose(t_s, Twb);
             const auto t_cov = Clock::now();
-            push_cov(backend_->get_state_idx(), t_s, Twb, &out);
-            if (P.dump_relcov) push_relcov(backend_->get_state_idx(), t_s);
+            kf_covariance(backend_->get_state_idx(), t_s, Twb, out);
             out.cov_ms = ms_since(t_cov);
         }
         const auto t_nav = Clock::now();
@@ -479,24 +494,145 @@ void VioEngine::push_cov(int idx, double t_s, const Eigen::Matrix4d& T, EngineOu
     Eigen::Matrix<double, 6, 6> C;
     if (!backend_->get_pose_covariance(idx, C)) C.setConstant(std::numeric_limits<double>::quiet_NaN());
     log_.kf_cov(t_s, T, C);
-    if (out && C.allFinite()) { out->has_cov = true; out->cov = C; }
+    if (out && C.allFinite()) { out->has_cov = true; out->cov = C; out->cov_R = T.block<3, 3>(0, 0); }
 }
 
-// main.cpp push_relcov.
-void VioEngine::push_relcov(int ib, double tb) {
+// main.cpp push_relcov: the keyframe pairs, 1 and 8 keyframes apart, whose relative pose is logged.
+std::vector<VioEngine::CovRel> VioEngine::relcov_queries(int ib, double tb) {
     kf_hist_.emplace_back(ib, tb);
+    std::vector<CovRel> q;
     for (int span : {1, 8}) {
         if ((int)kf_hist_.size() <= span) continue;
         const auto& a = kf_hist_[kf_hist_.size() - 1 - span];
         Eigen::Matrix4d Ta, Tb;
+        if (!backend_->get_pose_at(a.first, Ta) || !backend_->get_pose_at(ib, Tb)) continue;
+        q.push_back({a.first, ib, span, a.second, tb, Ta.inverse() * Tb});
+    }
+    return q;
+}
+
+void VioEngine::push_relcov(int ib, double tb) {
+    for (const auto& r : relcov_queries(ib, tb)) {
         Eigen::Matrix<double, 6, 6> S;
-        if (!backend_->get_pose_at(a.first, Ta) || !backend_->get_pose_at(ib, Tb)
-            || !backend_->get_relative_pose_covariance(a.first, ib, S)) continue;
-        log_.relcov(a.second, tb, span, Ta.inverse() * Tb, S);
+        if (backend_->get_relative_pose_covariance(r.ia, r.ib, S)) log_.relcov(r.ta, r.tb, r.span, r.T, S);
     }
 }
 
+// A keyframe's covariance rows and published covariance. Async, iSAM2's pose covariance (a read of
+// its Bayes tree) stays here and the rest goes to the covariance thread.
+void VioEngine::kf_covariance(int idx, double t_s, const Eigen::Matrix4d& T, EngineOutput& out) {
+    const VioParams& P = cfg_.P;
+    if (!cov_async_) {
+        push_cov(idx, t_s, T, &out);
+        if (P.dump_relcov) push_relcov(idx, t_s);
+        return;
+    }
+    CovJob j;
+    if (P.dump_covariance) {
+        if (backend_->cheap_pose_covariance()) push_cov(idx, t_s, T, &out);
+        else { j.poses.push_back({idx, t_s, T}); j.publish = true; }
+    }
+    if (P.dump_relcov) j.rels = relcov_queries(idx, t_s);
+    post_cov(std::move(j));
+}
+
+void VioEngine::post_cov(CovJob&& j) {
+    if (j.poses.empty() && j.rels.empty()) return;
+    j.session = session_;
+    j.t_ns = frame_t_ns_;
+    backend_->covariance_snapshot(j.snap);         // cov_async_ implies can_snapshot
+    j.posted = Clock::now();
+    bool dropped = false;
+    {
+        std::unique_lock<std::mutex> lk(cov_m_);
+        if (cfg_.lockstep) {
+            cov_cv_.wait(lk, [&] { return (int)cov_jobs_.size() < kCovQueue; });
+        } else if ((int)cov_jobs_.size() >= kCovQueue) {
+            cov_jobs_.pop_front();                 // the newest keyframe matters most
+            dropped = true;
+        }
+        cov_jobs_.push_back(std::move(j));
+    }
+    cov_cv_.notify_all();
+    if (dropped) log_.event(frame_t_ns_, "covariance job dropped: the covariance thread is behind");
+}
+
+void VioEngine::cov_loop() {
+    for (;;) {
+        CovJob j;
+        {
+            std::unique_lock<std::mutex> lk(cov_m_);
+            cov_cv_.wait(lk, [&] { return cov_closed_ || !cov_jobs_.empty(); });
+            if (cov_jobs_.empty()) break;          // closed, every job done
+            j = std::move(cov_jobs_.front());
+            cov_jobs_.pop_front();
+            cov_busy_ = true;
+        }
+        cov_cv_.notify_all();                      // a lockstep estimator may wait for room
+        const double wait_ms = ms_since(j.posted);
+        const auto t_job = Clock::now();
+        std::unique_ptr<gtsam::Marginals> m;
+        try {
+            m = std::make_unique<gtsam::Marginals>(j.snap.graph, j.snap.theta);
+        } catch (const std::exception& e) {
+            static int n = 0;
+            if (n++ < 3) std::cerr << "[cov] factorization of the window failed: " << e.what() << "\n";
+        }
+        Eigen::Matrix<double, 6, 6> C;
+        for (const auto& q : j.poses) {
+            if (!m || !VioBackend::pose_covariance(j.snap, *m, q.idx, C))
+                C.setConstant(std::numeric_limits<double>::quiet_NaN());
+            log_.kf_cov(q.t_s, q.T, C);
+        }
+        for (const auto& r : j.rels) {
+            Eigen::Matrix<double, 6, 6> S;
+            if (m && VioBackend::relative_pose_covariance(j.snap, *m, r.ia, r.ib, S))
+                log_.relcov(r.ta, r.tb, r.span, r.T, S);
+        }
+        log_.cov_job(j.t_ns, j.session, (int)j.poses.size(), (int)j.rels.size(), wait_ms, ms_since(t_job),
+                     thread_cpu_ms());
+        {
+            std::lock_guard<std::mutex> lk(cov_m_);
+            if (j.publish && C.allFinite()) {
+                cov_ready_ = true;
+                cov_ready_session_ = j.session;
+                cov_ready_C_ = C;
+                cov_ready_R_ = j.poses.back().T.block<3, 3>(0, 0);
+            }
+            cov_busy_ = false;
+        }
+        cov_cv_.notify_all();                      // drain_cov waits for an idle thread
+    }
+}
+
+void VioEngine::drain_cov() {
+    std::unique_lock<std::mutex> lk(cov_m_);
+    cov_cv_.wait(lk, [&] { return cov_jobs_.empty() && !cov_busy_; });
+}
+
+void VioEngine::join_cov() {
+    {
+        std::lock_guard<std::mutex> lk(cov_m_);
+        cov_closed_ = true;
+    }
+    cov_cv_.notify_all();
+    if (cov_th_.joinable()) cov_th_.join();
+}
+
+// The newest finished covariance of this session goes out with the next OK output.
+void VioEngine::take_cov(EngineOutput& out) {
+    std::lock_guard<std::mutex> lk(cov_m_);
+    if (!cov_ready_) return;
+    if (cov_ready_session_ != session_) { cov_ready_ = false; return; }
+    if (out.state != STATE_OK) return;
+    out.has_cov = true;
+    out.cov = cov_ready_C_;
+    out.cov_R = cov_ready_R_;
+    cov_ready_ = false;
+}
+
 void VioEngine::reset(bool hard, int64_t t_ns, const std::string& why) {
+    drain_cov();                                   // the old session's rows go to its own files
     backend_.reset();
     buf_.reset();
     running_ = false;
@@ -540,6 +676,7 @@ void VioEngine::finish() {
     if (sync_th_.joinable()) sync_th_.join();
     if (frontend_) frontend_->join();
     if (est_th_.joinable()) est_th_.join();
+    join_cov();
 }
 
 void VioEngine::stop() {
@@ -555,6 +692,7 @@ void VioEngine::stop() {
     if (sync_th_.joinable()) sync_th_.join();
     if (frontend_) frontend_->join();
     if (est_th_.joinable()) est_th_.join();
+    join_cov();                                    // at most kCovQueue jobs, the log stays complete
 }
 
 VioEngine::Stats VioEngine::stats() const {

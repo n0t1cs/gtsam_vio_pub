@@ -6,7 +6,7 @@
 // front-end thread, then runs the initialisation search and the backend frame by frame. Its
 // estimator is causal, so the same per-frame logic runs here on a live stream. Producers (the MPA
 // callbacks in the server, or the replay harness) push raw IMU samples and camera frames from any
-// thread. Four threads do the rest:
+// thread. Four threads do the rest, a fifth the keyframe covariances:
 //
 //   producer (IMU)    raw sample -> ImuFilter (the _lpf low-pass, online) -> IMU fifo
 //   producer (camera) frame copy -> pending frames (bounded, drop oldest unless lockstep)
@@ -17,6 +17,9 @@
 //   estimator         main.cpp Phase 1 (init search, VINS-style defer-until-well-conditioned) and
 //                     Phase 3 (integrate_imu_batch, detect_stationary, add_frame) per frame, plus
 //                     the health checks and resets that an online system needs
+//   covariance        (async_covariance) the keyframe covariance queries, from a snapshot of the
+//                     window: one factorization per keyframe, queue bounded, drop oldest unless
+//                     lockstep. Nothing in the estimate depends on them.
 //
 // Given the same inputs the estimate is the offline one: same helpers (offline_helpers.cpp), same
 // call order, same RNG seeding, same covariance queries (README, Validation).
@@ -74,6 +77,10 @@ struct EngineConfig {
     double imu_wait_timeout_s = 0.3;   // a frame still not covered by IMU after this is dropped
     int    img_queue = 2;              // sync -> front-end
     int    obs_queue = 4;              // front-end -> estimator
+    // Keyframe covariance queries (runtime.dump_covariance, dump_relcov) on their own thread, from
+    // a snapshot of the window, so the estimator thread moves on to the next frame. Same numbers
+    // in the logs. false: in the estimator thread, as before.
+    bool   async_covariance = true;
 
     // health, defaults from the vehicle's voxl-open-vins-server.conf where it has one
     bool   auto_reset = true;              // en_auto_reset
@@ -101,14 +108,21 @@ struct EngineOutput {
     Eigen::Vector3d v_w  = Eigen::Vector3d::Zero();
     Eigen::Vector3d bg   = Eigen::Vector3d::Zero(), ba = Eigen::Vector3d::Zero();
     Eigen::Vector3d w_body = Eigen::Vector3d::Zero();      // last filtered gyro minus bias
-    bool has_cov = false;          // keyframes only, when runtime.dump_covariance
+    // A keyframe's pose covariance, when runtime.dump_covariance: on the keyframe itself, or with
+    // async_covariance on a later frame (the SLKS factorizes its window for it, on the covariance
+    // thread). cov_R is the rotation of that keyframe, which the covariance's tangent refers to.
+    bool has_cov = false;
     Eigen::Matrix<double, 6, 6> cov = Eigen::Matrix<double, 6, 6>::Zero();   // GTSAM [rot, trans]
+    Eigen::Matrix3d cov_R = Eigen::Matrix3d::Identity();
     std::vector<std::pair<int64_t, Eigen::Vector2d>> features;           // id, pinhole pixel
     double latency_ms = 0.0;       // engine entry of the frame -> this output, wall clock
     double kf_update_ms = 0.0;     // add_frame time on a keyframe
     // Cost study, wall [ms]: the remap (sync thread), the tracker's stages (front-end thread), the
-    // estimator thread's work on this frame up to its log row, and its parts. *_cpu_ms: a thread's
-    // CPU clock when it finished this frame (cumulative, the front-end's is in fe.thread_cpu_ms).
+    // estimator thread's work on this frame up to its log row, and its parts (cov_ms: the
+    // covariance work left in the estimator thread, with async_covariance iSAM2's pose covariance,
+    // the snapshot and the hand-over). *_cpu_ms: a thread's CPU clock when it finished this frame
+    // (cumulative, the front-end's is in fe.thread_cpu_ms). The covariance thread logs its own work
+    // in cov_jobs.csv.
     double remap_ms = 0.0, est_ms = 0.0, add_frame_ms = 0.0, cov_ms = 0.0, nav_ms = 0.0;
     vio::FrontendCost fe;
     double sync_cpu_ms = 0.0, est_cpu_ms = 0.0;
@@ -168,6 +182,27 @@ private:
     void push_cov(int idx, double t_s, const Eigen::Matrix4d& T, EngineOutput* out);
     void push_relcov(int ib, double tb);
 
+    // async_covariance: one job per keyframe (and one for the init window), the queries the
+    // estimator thread would run, with a snapshot of the window to answer them from.
+    struct CovPose { int idx; double t_s; Eigen::Matrix4d T; };                   // vio_cov.csv row
+    struct CovRel  { int ia, ib, span; double ta, tb; Eigen::Matrix4d T; };       // vio_relcov.csv row
+    struct CovJob {
+        int session = 0;
+        int64_t t_ns = 0;                  // the frame that posted it
+        bool publish = false;              // the last pose's covariance goes to the output
+        std::vector<CovPose> poses;
+        std::vector<CovRel> rels;
+        vio::VioBackend::CovSnapshot snap;
+        std::chrono::steady_clock::time_point posted;
+    };
+    std::vector<CovRel> relcov_queries(int ib, double tb);
+    void kf_covariance(int idx, double t_s, const Eigen::Matrix4d& T, EngineOutput& out);
+    void post_cov(CovJob&& j);
+    void cov_loop();
+    void drain_cov();                  // wait until every posted job is done (a reset)
+    void join_cov();                   // finish the posted jobs, then end the thread
+    void take_cov(EngineOutput& out);  // a finished keyframe covariance for this output
+
     EngineConfig cfg_;
     std::function<void(const EngineOutput&)> on_output_;
     OutputLog log_;
@@ -212,6 +247,19 @@ private:
     uint32_t sticky_err_ = 0;                       // reported once, then cleared
     std::vector<std::pair<int, double>> kf_hist_;   // (state index, t_s) of online keyframes
     std::atomic<bool> reset_hard_{false}, reset_soft_{false};
+    int64_t frame_t_ns_ = -1;                       // the frame being processed
+    bool cov_async_ = false;                        // this session's covariance goes to cov_th_
+
+    // covariance thread
+    std::thread cov_th_;
+    std::mutex cov_m_;
+    std::condition_variable cov_cv_;
+    std::deque<CovJob> cov_jobs_;
+    bool cov_busy_ = false, cov_closed_ = false;
+    bool cov_ready_ = false;                        // a published covariance waits for an output
+    int cov_ready_session_ = -1;
+    Eigen::Matrix<double, 6, 6> cov_ready_C_;
+    Eigen::Matrix3d cov_ready_R_;
 
     // stats
     mutable std::mutex stats_m_;

@@ -33,6 +33,7 @@ opencv_threads: -1                       # OpenCV workers: -1 = OpenCV's default
 realtime:
   max_pending_frames: 3                  # frames waiting for IMU coverage, oldest dropped beyond
   imu_wait_timeout_s: 0.3
+  async_covariance: true                 # keyframe covariances on their own thread, false = inline
 
 health:                                  # defaults from the vehicle's voxl-open-vins-server.conf
   auto_reset: true

@@ -6,6 +6,7 @@
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/navigation/PreintegrationParams.h>
+#include <gtsam/nonlinear/Marginals.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/geometry/Pose3.h>
@@ -82,6 +83,27 @@ public:
     // indeterminate.
     bool get_relative_pose_covariance(int ia, int ib,
                                       Eigen::Matrix<double, 6, 6>& out) const;
+
+    // The two queries above, answered on another thread. A snapshot holds what they read: the
+    // window's factors (shared, no factor changes once built) and copies of the linearization
+    // point and of the estimate's poses. One gtsam::Marginals of it serves every query of a
+    // keyframe. On the SLKS the numbers are the live queries' bit for bit (each live query builds
+    // that same Marginals). iSAM2's live pose query reads its Bayes tree instead, which a snapshot
+    // cannot share (ISAM2::marginalizeLeaves edits conditionals in place): it is cheap, so
+    // callers keep it live (cheap_pose_covariance). Smart mode has no snapshot (smart factors
+    // cache their triangulation).
+    struct CovSnapshot {
+        gtsam::NonlinearFactorGraph graph;
+        gtsam::Values theta;   // linearization point
+        gtsam::Values poses;   // X(i) of the estimate (relative-pose Jacobians)
+    };
+    bool covariance_snapshot(CovSnapshot& s) const;
+    bool can_snapshot() const { return !smart_mode_; }
+    bool cheap_pose_covariance() const { return isam_view_ != nullptr; }
+    static bool pose_covariance(const CovSnapshot& s, const gtsam::Marginals& m, int idx,
+                                Eigen::Matrix<double, 6, 6>& out);
+    static bool relative_pose_covariance(const CovSnapshot& s, const gtsam::Marginals& m, int ia, int ib,
+                                         Eigen::Matrix<double, 6, 6>& out);
 
     void add_imu(double dt, const Eigen::Vector3d& accel, const Eigen::Vector3d& gyro);
 

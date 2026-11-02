@@ -51,7 +51,7 @@ PublishedState PublishFrame::convert(const EngineOutput& o) {
     s.v = M_ * o.v_w;
     s.gravity = Eigen::Vector3d(0, 0, 1);            // M maps the estimator's -z gravity onto +z
     if (o.has_cov && o.cov.allFinite()) {
-        upper21(to_xyzrpy(o.cov, s.R), last_cov_);
+        upper21(to_xyzrpy(o.cov, M_ * o.cov_R), last_cov_);   // the keyframe's rotation, not this frame's
         have_cov_ = true;
     }
     s.cov_valid = have_cov_;

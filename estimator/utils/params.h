@@ -18,6 +18,9 @@ struct VioParams {
     // Consistency-study knobs.
     bool   dump_covariance   = false;  // dump per-KF pose + 6x6 marginal covariance for NEES
     bool   dump_relcov       = false;  // dump per-KF relative pose + covariance (spans 1, 8 KF) for relative NEES
+    bool   nis_prefit        = false;  // NIS metric A (needs dump_covariance): one more pose-covariance query per
+                                       // KF inside add_frame, a full factorization on the SLKS. Only
+                                       // print_kf_stats reads it (offline main.cpp), so the online system skips it.
     bool   deterministic     = false;  // pin TBB to 1 thread for bit-reproducible runs (NEES needs it)
     int    rng_seed          = 0;      // seed of every OpenCV/std RANSAC (main and front-end threads).
                                        // 0 = the historical seed. Other values give runs that differ

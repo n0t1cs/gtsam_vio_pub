@@ -45,7 +45,7 @@ static void usage() {
         "usage: gvio-engine-replay (--dataset DIR | --voxl-log DIR) --config ESTIMATOR.yaml --out DIR\n"
         "         [--rate R] [--lpf on|off] [--cam NAME] [--intrinsics YML] [--extrinsics CONF]\n"
         "         [--balance B] [--pin-K fu,fv,cu,cv] [--imu-batch-ms MS] [--max-frames N]\n"
-        "         [--start-frame N] [--opencv-threads N] [--no-auto-reset]\n"
+        "         [--start-frame N] [--opencv-threads N] [--sync-covariance] [--no-auto-reset]\n"
         "  defaults: --rate 0 (lockstep), --lpf off for --dataset and on for --voxl-log,\n"
         "            --cam tracking_front_misp_norm, intrinsics and extrinsics from the log itself\n";
 }
@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     std::string dataset, voxl_log, config, out_dir, cam = "tracking_front_misp_norm", intr, extr, lpf, pin;
     double rate = 0.0, balance = 0.0, imu_batch_ms = 10.0;
     long max_frames = -1, start_frame = 0, opencv_threads = -1;
-    bool auto_reset = true;
+    bool auto_reset = true, async_cov = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { usage(); std::exit(2); } return argv[++i]; };
@@ -118,6 +118,7 @@ int main(int argc, char** argv) {
         else if (a == "--start-frame") start_frame = std::stol(next());
         else if (a == "--opencv-threads") opencv_threads = std::stol(next());
         else if (a == "--no-auto-reset") auto_reset = false;
+        else if (a == "--sync-covariance") async_cov = false;
         else { usage(); return 2; }
     }
     if ((dataset.empty() == voxl_log.empty()) || config.empty() || out_dir.empty()) { usage(); return 2; }
@@ -132,6 +133,7 @@ int main(int argc, char** argv) {
     cfg.P = vio::VioParams::load(config);
     cfg.lockstep = (rate <= 0.0);
     cfg.auto_reset = auto_reset;
+    cfg.async_covariance = async_cov;
     cfg.log_dir = out_dir;
 
     std::vector<Frame> frames;

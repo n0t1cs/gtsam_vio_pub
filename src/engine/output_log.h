@@ -7,6 +7,9 @@
 //   frames.csv                       every frame: absolute stamp, state, pose at that frame, latency,
 //                                    and its cost: remap, tracker stages, estimator thread parts
 //                                    [ms], each thread's CPU clock (EngineOutput)
+//   cov_jobs.csv                     async_covariance: per job of the covariance thread, the frame
+//                                    that posted it, its rows, queue wait and work [ms], the
+//                                    thread's CPU clock (cumulative)
 //   events.log                       init, resets, drops, faults
 //   meta.txt                         t0_ns of the time base and the configuration in use
 // A session is one initialisation: a reset starts session k+1. Rows are flushed as they are
@@ -35,10 +38,12 @@ public:
     void kf_cov(double t_s, const Eigen::Matrix4d& T, const Eigen::Matrix<double, 6, 6>& C);
     void relcov(double ta, double tb, int span, const Eigen::Matrix4d& T, const Eigen::Matrix<double, 6, 6>& S);
     void frame(const EngineOutput& o);
+    void open_cov_jobs();
+    void cov_job(int64_t t_ns, int session, int n_pose, int n_rel, double wait_ms, double work_ms, double cpu_ms);
 
 private:
     std::string dir_;
-    std::ofstream meta_, events_, frames_, tum_, cov_, rel_;
+    std::ofstream meta_, events_, frames_, tum_, cov_, rel_, cov_jobs_;
 };
 
 } // namespace gvio

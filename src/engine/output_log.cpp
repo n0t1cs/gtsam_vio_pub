@@ -101,4 +101,18 @@ void OutputLog::frame(const EngineOutput& o) {
             << ',' << o.est_cpu_ms << std::defaultfloat << "\n" << std::flush;
 }
 
+void OutputLog::open_cov_jobs() {
+    if (!enabled()) return;
+    cov_jobs_.open(dir_ + "/cov_jobs.csv");
+    cov_jobs_ << "t_ns,session,n_pose,n_rel,wait_ms,work_ms,cpu_cov_ms\n" << std::flush;
+}
+
+void OutputLog::cov_job(int64_t t_ns, int session, int n_pose, int n_rel, double wait_ms, double work_ms,
+                        double cpu_ms) {
+    if (!cov_jobs_.is_open()) return;
+    cov_jobs_ << t_ns << ',' << session << ',' << n_pose << ',' << n_rel << std::setprecision(4)
+              << ',' << wait_ms << ',' << work_ms << std::fixed << std::setprecision(3) << ',' << cpu_ms
+              << std::defaultfloat << "\n" << std::flush;
+}
+
 } // namespace gvio

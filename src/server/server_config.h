@@ -42,6 +42,7 @@ struct ServerConfig {
     // real time and health
     int    max_pending_frames = 3;
     double imu_wait_timeout_s = 0.3;
+    bool   async_covariance = true;          // keyframe covariances on their own thread (EngineConfig)
     bool   auto_reset = true;
     double max_velocity_mps = 20.0;
     int    min_features = 1;

@@ -30,6 +30,7 @@ VioParams VioParams::load(const std::string& path) {
     rd(rt, "diag",           p.diag);
     rd(rt, "dump_covariance", p.dump_covariance);
     rd(rt, "dump_relcov",     p.dump_relcov);
+    rd(rt, "nis_prefit",      p.nis_prefit);
     rd(rt, "deterministic",   p.deterministic);
     rd(rt, "rng_seed",        p.rng_seed);
     rd(rt, "kf_window_size", p.kf_window_size);

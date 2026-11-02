@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
     ec.imu_filter.rate_hz = sc.imu_rate_hz;
     ec.max_pending_frames = sc.max_pending_frames;
     ec.imu_wait_timeout_s = sc.imu_wait_timeout_s;
+    ec.async_covariance = sc.async_covariance;
     ec.auto_reset = sc.auto_reset;
     ec.max_velocity_mps = sc.max_velocity_mps;
     ec.min_features = sc.min_features;
