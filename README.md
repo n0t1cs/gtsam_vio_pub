@@ -21,7 +21,7 @@ Given the same inputs, the online engine reproduces the offline estimate byte fo
 |---|---|
 | online engine (`src/engine`) | built and validated on an x86 desktop (Validation) |
 | published frame | checked against motion capture: no axis flip, 9.7 cm rms after aligning one pose |
-| MPA server (`src/server`) | run on a VOXL2 with iSAM2, fed by ModalAI's `voxl-replay` from two recorded flights: real time on every run, no frame dropped in flight (Validation). The SLKS on the board: not yet measured |
+| MPA server (`src/server`) | run on a VOXL2 with both backends, fed by ModalAI's `voxl-replay` from two recorded flights and the 11 EuRoC sequences: iSAM2 in real time on every run, the SLKS drops frames on the 30 Hz flight and on 5 of the 11 sequences (Validation) |
 | pipe replay for desktops (`tools/gvio_replay.cpp`) | built on the VOXL2, not used there (the bench test uses `voxl-replay`) |
 | VOXL2 build on the board (`scripts/build_voxl2_native.sh`) | done on a VOXL2 (system image 1.8, voxl-suite 1.5.1). The project stage needs 1 parallel job (below) |
 | cross build and package (`scripts/build_voxl2.sh`, `make_package.sh`) | written, untested |
@@ -188,7 +188,9 @@ is recovered exactly by matching `frames.csv` to `data.csv`. Before any flight, 
    between keyframes, and an accuracy within the run-to-run spread of desktop runs of the same log.
    Latency from a frame's arrival to its output is longer than one frame interval by design (it
    waits for IMU coverage), so it is no criterion. This measures the VOXL2's CPU, which the desktop
-   cannot.
+   cannot. `scripts/run_board_campaign.sh` runs such replays as seed sets, one at a time, both
+   backends, with the services stopped and restored, and repeats a run whose pipes failed (its header
+   has the details and how to launch it detached).
 2. **Live, hand-held,** next to the on-board VIO (`voxl-cpu-monitor` for the CPU), comparing `gvio`
    with `ov` or `qvio`.
 3. **Flight** with `vio_pipe` in `/etc/modalai/voxl-vision-hub.conf` still on the on-board VIO, `gvio`
@@ -249,7 +251,14 @@ motion capture, then on a VOXL2.
   9.6 % worse on average, which five runs per side cannot separate from noise (paired t-test
   p = 0.15). The server's CPU is proportional to the frame rate, 0.10 core-seconds per frame on both
   flights: the per-frame front-end, not the keyframe solve, sets the cost.
-- **Not yet:** the SLKS on the VOXL2, flight.
+- **On a VOXL2, both backends.** The same flights, five seeds per backend, and the 11 EuRoC sequences
+  written as voxl-logger logs, five seeds per backend (`scripts/run_board_campaign.sh`). iSAM2 kept
+  real time on every run. The SLKS lost 96 to 117 frames per run on the 30 Hz flight and 1 to 8 on 5
+  of the 11 sequences, its keyframe update taking about twice iSAM2's (51 against 25 ms median on
+  EuRoC). On EuRoC the board's iSAM2 ATE is about 10 % above the desktop estimator's, which is under
+  investigation. Three runs of an earlier build aborted at startup when a stamp jump reached the IMU
+  filter's rate fit: the filter now drops the samples before such a gap and never throws on its input.
+- **Not yet:** flight.
 
 ## Layout
 
@@ -262,6 +271,7 @@ tools/         gvio_engine_replay.cpp (desktop bench, no MPA), gvio_replay.cpp (
                published on pipes), gvio_publish_check.cpp (the published frame on a log, no MPA)
 config/        voxl-gtsam-vio-server.yaml (vehicle), estimator_mantis2.yaml, test_mpa_*.yaml
                (desktop MPA tests, pipes under /tmp/gvio_mpa)
-scripts/       eval_online.py, build_mpa_x86.sh, build_voxl2_native.sh, build_voxl2.sh, make_package.sh
+scripts/       eval_online.py, build_mpa_x86.sh, build_voxl2_native.sh, build_voxl2.sh, make_package.sh,
+               run_board_campaign.sh (seed sets on the VOXL2 through voxl-replay)
 service/       systemd unit
 ```

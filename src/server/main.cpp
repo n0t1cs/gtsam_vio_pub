@@ -63,25 +63,13 @@ int main(int argc, char** argv) {
         Eigen::Vector4d pin;
         if (sc.pinhole_override.size() == 4)
             pin << sc.pinhole_override[0], sc.pinhole_override[1], sc.pinhole_override[2], sc.pinhole_override[3];
-        Eigen::Vector4d dist = Eigen::Vector4d::Zero();
-        if (ic.model == "fisheye") {
-            ec.undistort.init_fisheye(ic, sc.undistort_balance, sc.pinhole_override.empty() ? nullptr : &pin);
-        } else {
-            // A radtan calibration: no remap, the tracker undistorts its points (k1, k2, p1, p2).
-            if (ic.D.total() > 4 && std::abs(ic.D.at<double>(4)) > 0.0)
-                throw std::runtime_error("radtan calibration with k3 != 0 is not supported");
-            for (int k = 0; k < 4 && k < (int)ic.D.total(); ++k) dist(k) = ic.D.at<double>(k);
-            Eigen::Matrix3d K;
-            for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) K(r, c) = ic.K.at<double>(r, c);
-            ec.undistort.init_passthrough(K, ic.width, ic.height);
-        }
         Eigen::Matrix4d T_BC = gvio::load_voxl_extrinsic(sc.extrinsics_file, sc.imu_frame, sc.camera_name);
         if (ec.P.ext_T_BC.size() == 16) {
             T_BC = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::RowMajor>>(ec.P.ext_T_BC.data());
             std::cout << "[extrinsics] T_BC OVERRIDDEN by the estimator config's extrinsics block\n";
         }
-        ec.calib = gvio::make_cam_calib(ec.undistort, T_BC, 30);
-        ec.calib.dist = dist;
+        ec.calib = gvio::setup_voxl_camera(ic, sc.undistort_balance, sc.pinhole_override.empty() ? nullptr : &pin,
+                                           T_BC, ec.undistort);
         std::cout << "[camera] " << sc.camera_name << " " << ic.model << " " << ic.width << "x" << ic.height
                   << " -> pinhole fu " << ec.calib.K(0, 0) << " fv " << ec.calib.K(1, 1) << " cu "
                   << ec.calib.K(0, 2) << " cv " << ec.calib.K(1, 2) << "\n[camera] T_BC (camera in "

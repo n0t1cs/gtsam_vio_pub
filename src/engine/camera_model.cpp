@@ -4,6 +4,7 @@
 #include <opencv2/imgproc.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -125,6 +126,25 @@ vio::CamCalib make_cam_calib(const Undistorter& u, const Eigen::Matrix4d& T_BC, 
     c.width = u.width();
     c.height = u.height();
     c.rate_hz = rate_hz;
+    return c;
+}
+
+vio::CamCalib setup_voxl_camera(const OpenCvIntrinsics& ic, double balance, const Eigen::Vector4d* pinned,
+                                const Eigen::Matrix4d& T_BC, Undistorter& u) {
+    Eigen::Vector4d dist = Eigen::Vector4d::Zero();
+    if (ic.model == "fisheye") {
+        u.init_fisheye(ic, balance, pinned);
+    } else {
+        // A radtan calibration: no remap, the tracker undistorts its points (k1, k2, p1, p2).
+        if (ic.D.total() > 4 && std::abs(ic.D.at<double>(4)) > 0.0)
+            throw std::runtime_error("radtan calibration with k3 != 0 is not supported");
+        for (int k = 0; k < 4 && k < (int)ic.D.total(); ++k) dist(k) = ic.D.at<double>(k);
+        Eigen::Matrix3d K;
+        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) K(r, c) = ic.K.at<double>(r, c);
+        u.init_passthrough(K, ic.width, ic.height);
+    }
+    vio::CamCalib c = make_cam_calib(u, T_BC, 30);
+    c.dist = dist;
     return c;
 }
 

@@ -62,4 +62,10 @@ private:
 // The estimator's CamCalib: the pinhole K of the undistorter, zero distortion, T_BC, size, rate.
 vio::CamCalib make_cam_calib(const Undistorter& u, const Eigen::Matrix4d& T_BC, int rate_hz);
 
+// The camera of a VOXL calibration, as the server and gvio-engine-replay both build it: a fisheye one
+// is remapped to a virtual pinhole (balance, or the `pinned` K), a radtan one passes through and the
+// tracker undistorts its points (k1, k2, p1, p2, throws on k3 != 0). Sets `u`, returns the CamCalib.
+vio::CamCalib setup_voxl_camera(const OpenCvIntrinsics& ic, double balance, const Eigen::Vector4d* pinned,
+                                const Eigen::Matrix4d& T_BC, Undistorter& u);
+
 } // namespace gvio

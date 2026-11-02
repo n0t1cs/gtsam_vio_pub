@@ -4,8 +4,13 @@
 // into the same VioEngine the server uses. This is the desktop test bench of the online system:
 //   --dataset DIR   a EuRoC-layout dataset (EuRoC, or a mantis_qualisys_<log>[_lpf]): images are
 //                   already pinhole, the dataset's sensor.yaml is the camera, IMU as written
-//   --voxl-log DIR  a raw VOXL MPA log (voxl-logger): fisheye PNG of --cam and run/mpa/imu_apps,
-//                   undistorted and low-passed online exactly as the server does on the vehicle
+//   --voxl-log DIR  a raw VOXL MPA log (voxl-logger): PNG of --cam and run/mpa/imu_apps, the camera
+//                   built from the log's calibration and the IMU low-passed exactly as the server
+//                   does on the vehicle (setup_voxl_camera: a fisheye one remapped, a radtan one
+//                   passed to the tracker)
+//   --start-frame N the first N frames are not fed, nor the IMU stamped before frame N-1: the board's
+//                   server connects after voxl-replay started (on EuRoC logs it received the frames
+//                   from row 10 on, the IMU from about one camera period before them)
 // Timing:
 //   --rate 0        lockstep: nothing is dropped, every frame waits for the previous ones. With
 //                   the IMU filter off this must reproduce the offline binary byte for byte.
@@ -19,6 +24,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -39,7 +45,7 @@ static void usage() {
         "usage: gvio-engine-replay (--dataset DIR | --voxl-log DIR) --config ESTIMATOR.yaml --out DIR\n"
         "         [--rate R] [--lpf on|off] [--cam NAME] [--intrinsics YML] [--extrinsics CONF]\n"
         "         [--balance B] [--pin-K fu,fv,cu,cv] [--imu-batch-ms MS] [--max-frames N]\n"
-        "         [--no-auto-reset]\n"
+        "         [--start-frame N] [--no-auto-reset]\n"
         "  defaults: --rate 0 (lockstep), --lpf off for --dataset and on for --voxl-log,\n"
         "            --cam tracking_front_misp_norm, intrinsics and extrinsics from the log itself\n";
 }
@@ -91,7 +97,7 @@ int main(int argc, char** argv) {
     std::cout << std::unitbuf;
     std::string dataset, voxl_log, config, out_dir, cam = "tracking_front_misp_norm", intr, extr, lpf, pin;
     double rate = 0.0, balance = 0.0, imu_batch_ms = 10.0;
-    long max_frames = -1;
+    long max_frames = -1, start_frame = 0;
     bool auto_reset = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -109,6 +115,7 @@ int main(int argc, char** argv) {
         else if (a == "--pin-K") pin = next();
         else if (a == "--imu-batch-ms") imu_batch_ms = std::stod(next());
         else if (a == "--max-frames") max_frames = std::stol(next());
+        else if (a == "--start-frame") start_frame = std::stol(next());
         else if (a == "--no-auto-reset") auto_reset = false;
         else { usage(); return 2; }
     }
@@ -147,18 +154,24 @@ int main(int argc, char** argv) {
             std::string x;
             for (int k = 0; k < 4 && std::getline(ss, x, ','); ++k) pk(k) = std::stod(x);
         }
-        cfg.undistort.init_fisheye(ic, balance, pin.empty() ? nullptr : &pk);
         const Eigen::Matrix4d T_BC = gvio::load_voxl_extrinsic(
             extr.empty() ? (log / "etc/modalai/extrinsics.conf").string() : extr, "imu_apps", sensor);
+        cfg.calib = gvio::setup_voxl_camera(ic, balance, pin.empty() ? nullptr : &pk, T_BC, cfg.undistort);
         frames = voxl_frames(log / "run/mpa" / cam);
         imu = voxl_imu(log / "run/mpa/imu_apps/data.csv");
-        cfg.calib = gvio::make_cam_calib(cfg.undistort, T_BC, 30);
         cfg.imu_filter.enable = (lpf != "off");
     }
     // main.cpp applies an `extrinsics:` block of the estimator config the same way.
     if (cfg.P.ext_T_BC.size() == 16) {
         cfg.calib.T_BC = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::RowMajor>>(cfg.P.ext_T_BC.data());
         std::cout << "[extrinsics] cam0 T_BC OVERRIDDEN from config\n";
+    }
+    if (start_frame > 0) {
+        if (start_frame >= (long)frames.size()) { std::cerr << "ERROR: --start-frame past the last frame\n"; return 2; }
+        const int64_t t_imu0 = frames[start_frame - 1].t_ns;
+        frames.erase(frames.begin(), frames.begin() + start_frame);
+        imu.erase(imu.begin(), std::lower_bound(imu.begin(), imu.end(), t_imu0,
+                                                [](const vio::ImuSample& s, int64_t t) { return s.t_ns < t; }));
     }
     if (max_frames > 0 && (long)frames.size() > max_frames) frames.resize(max_frames);
     if (frames.empty() || imu.empty()) { std::cerr << "ERROR: no frames or no IMU\n"; return 1; }

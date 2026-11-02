@@ -49,14 +49,16 @@ public:
 
     // Feed one raw sample. Filtered samples (none during the warm-up, then one per input, or the
     // whole warm-up backlog at once) are appended to `out`. Returns false when the sample was
-    // rejected because its stamp does not increase.
+    // rejected because its stamp does not increase. Never throws on the input: a stamp gap inside
+    // the warm-up drops the samples before it, and a fitted rate that disagrees with the median
+    // interval restarts the warm-up.
     bool push(const vio::ImuSample& raw, std::vector<vio::ImuSample>& out);
 
     bool    designed() const     { return designed_; }
     double  rate_hz() const      { return fs_; }
     double  tau_s() const        { return tau_s_; }
     int64_t tau_ns() const       { return tau_ns_; }
-    int     n_gaps() const       { return n_gaps_; }
+    int     n_gaps() const       { return n_gaps_; }   // filter restarts and warm-up restarts
     int     n_rejected() const   { return n_rejected_; }
     const std::vector<Biquad>& sos() const { return sos_; }
 

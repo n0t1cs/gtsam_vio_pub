@@ -143,6 +143,25 @@ bool ImuFilter::push(const vio::ImuSample& raw, std::vector<vio::ImuSample>& out
     if (!designed_) {
         warm_.push_back(raw);
         if ((int)warm_.size() < std::max(16, p_.warmup_samples)) return true;
+        // A stamp jump inside the warm-up biases the fit below. On the VOXL2 one made the fitted rate
+        // fall under twice the cutoff, the design threw and the server aborted (3 of 20 runs). Keep
+        // only the samples after the last gap and wait for a full warm-up of clean ones.
+        std::vector<double> dt(warm_.size() - 1);
+        for (size_t i = 1; i < warm_.size(); ++i) dt[i - 1] = (warm_[i].t_ns - warm_[i - 1].t_ns) * 1e-9;
+        std::vector<double> sorted(dt);
+        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+        const double med = sorted[sorted.size() / 2];
+        size_t cut = 0;
+        for (size_t i = 0; i < dt.size(); ++i)
+            if (dt[i] > p_.gap_reset_periods * med) cut = i + 1;
+        if (cut > 0) {
+            ++n_gaps_;
+            std::cerr << "[imu-lpf] warm-up: gap of " << dt[cut - 1] * 1e3 << " ms after sample " << cut
+                      << " (median interval " << med * 1e3 << " ms), the " << cut
+                      << " samples before it dropped, warm-up continues\n";
+            warm_.erase(warm_.begin(), warm_.begin() + cut);
+            return true;
+        }
         // Period = least-squares slope of stamp against sample index over the warm-up (the offline
         // filter took it from the same fit over the whole flight).
         const double n = (double)warm_.size();
@@ -153,6 +172,15 @@ bool ImuFilter::push(const vio::ImuSample& raw, std::vector<vio::ImuSample>& out
             si += i; st += t; sii += (double)i * i; sit += i * t;
         }
         const double slope = (n * sit - si * st) / (n * sii - si * si);
+        // The fit must agree with the median interval and leave the cutoff below Nyquist, or the
+        // design would throw: never abort on the input, measure again.
+        if (!(slope > 0.0) || std::abs(slope / med - 1.0) > 0.05 || !(1.0 / slope > 2.0 * p_.cutoff_hz)) {
+            ++n_gaps_;
+            std::cerr << "[imu-lpf] warm-up: fitted period " << slope * 1e3 << " ms against a median interval of "
+                      << med * 1e3 << " ms, warm-up restarted\n";
+            warm_.clear();
+            return true;
+        }
         design(1.0 / slope);
         for (const auto& s : warm_) filter_one(s, out);   // backlog, from the first sample's steady state
         warm_.clear();
