@@ -30,7 +30,7 @@ Given the same inputs, the online engine reproduces the offline estimate byte fo
 ## How it works
 
 ```
- MPA imu_apps ──► ImuFilter (Butterworth order 4 at 25 Hz, online) ──► IMU fifo ───────────────┐
+ MPA imu_apps ──► ImuFilter (Butterworth order 4 at 25 Hz, off by default) ──► IMU fifo ───────┐
  MPA tracking_front_misp_norm ──► frame copy ──► pending frames (bounded) ──────────────────────┤
                                                                                                  ▼
   sync thread: waits until the filtered IMU passes a frame's stamp, hands every IMU sample up to it
@@ -49,9 +49,12 @@ Given the same inputs, the online engine reproduces the offline estimate byte fo
 
 Design notes:
 
-- **IMU.** The 1 kHz `imu_apps` stream carries the rotor tone (about 85 Hz) and is low-passed online
-  (Butterworth order 4 at 25 Hz, gain 6.9e-3 at 85 Hz). Each filtered sample is stamped with its raw
-  stamp minus the filter's group delay at 1 Hz (16.6 ms at 1024 Hz).
+- **IMU.** The 1 kHz `imu_apps` stream (behind the IMU chip's 92 Hz low-pass) carries the rotor tone
+  (about 85 Hz). The estimator takes it raw by default: preintegration averages the tone over each frame
+  interval, and on both test flights the raw stream lost no accuracy against an online low-pass
+  (Butterworth order 4 at 25 Hz) while lowering the latency p50 by 34 to 39 ms. The low-pass stays
+  available (`imu_lowpass.enable`). When on, each filtered sample is stamped with its raw stamp minus the
+  filter's group delay at 1 Hz (16.6 ms at 1024 Hz).
 - **Camera.** Every fisheye frame is remapped to a pinhole of the same size, from the vehicle's own
   calibration files (`/data/modalai/opencv_<camera>_intrinsics.yml`, `/etc/modalai/extrinsics.conf`):
   new camera matrix from `cv::fisheye::estimateNewCameraMatrixForUndistortRectify` at balance 0,
@@ -207,7 +210,7 @@ is recovered exactly by matching `frames.csv` to `data.csv`. Before any flight, 
 |---|---|---|
 | `camera_pipe`, `camera_name` | tracking_front_misp_norm, tracking_front | the input stream and its calibration entry |
 | `undistort_balance`, `pinhole_override` | 0.0, none | the virtual pinhole. A pin is for parity tests against a fixed dataset only |
-| `imu_lowpass` | on, 4, 25 Hz | the estimator's IMU noise was calibrated on the filtered stream |
+| `imu_lowpass` | off (order 4, 25 Hz when on) | raw imu_apps by default. On, the low-pass the estimator's IMU noise was first calibrated on, 16.6 ms of delay |
 | `output_pipe(_extended)` | gvio, gvio_extended | point `voxl-vision-hub`'s `vio_pipe` here to fly on it |
 | `health.*` | the on-board OpenVINS server's values | automatic reset thresholds |
 | `log_dir` | /data/gvio | disk log per start, empty disables it |

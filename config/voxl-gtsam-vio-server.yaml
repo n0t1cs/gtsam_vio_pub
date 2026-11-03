@@ -15,9 +15,12 @@ pinhole_override: []                     # [fu, fv, cu, cv]: pin the virtual pin
                                          # Never leave a pin after recalibrating the camera.
 camera_time_offset_ns: 0                 # 0 = metadata stamp (start of exposure), as offline
 
-# The IMU low-pass of every mantis_qualisys_<log>_lpf dataset (the IMU noise was calibrated on it).
+# The IMU low-pass of every mantis_qualisys_<log>_lpf dataset (Butterworth order 4 at 25 Hz, 16.6 ms
+# group delay, the IMU noise was calibrated on it). Off since 2026-11-02: the raw 1 kHz imu_apps,
+# behind the IMU chip's 92 Hz low-pass, lost no accuracy on either flight and cut the latency p50 by
+# 34 to 39 ms on the VOXL2.
 imu_lowpass:
-  enable: true
+  enable: false
   order: 4
   cutoff_hz: 25.0
   rate_hz: 0                             # 0 = measured from the first 1024 samples
