@@ -8,20 +8,18 @@
 #
 #   bash scripts/run_board_campaign.sh [--out DIR] [--logs "MH_01_easy ..."] [--seeds "0 1 2 3 4"]
 #                                      [--backends "incremental keyframe"] [--cooldown S]
-#                                      [--opencv-threads N] [--covariance async|inline]
-#                                      [--imu-lowpass on|off] [--dry-run]
+#                                      [--opencv-threads N] [--covariance async|inline] [--dry-run]
 #
 # --opencv-threads N sets the server's opencv_threads (0 = OpenCV runs in the calling thread), so a
 # stage's wall time in frames.csv is also its CPU time. --covariance sets realtime.async_covariance
-# (the keyframe covariances on their own thread, or in the estimator thread). --imu-lowpass sets
-# imu_lowpass.enable (off: the raw 1 kHz IMU, without the 25 Hz filter and its 16.6 ms delay). Without
-# them the config's values are kept.
+# (the keyframe covariances on their own thread, or in the estimator thread). Without them the
+# config's values are kept.
 #
 # Two kinds of log, told apart by name, each run with its own configuration:
 #   EuRoC   MH_* V1_* V2_*  /data/logs/euroc/<seq>/ (a EuRoC sequence written in the voxl-logger layout,
 #                           cam0 as tracking_front_misp_norm, imu0 as imu_apps), estimator
 #                           /data/logs/euroc/config/estimator_euroc_{mh,vicon}.yaml, server
-#                           /data/logs/euroc/config/voxl-gtsam-vio-server_euroc.yaml (IMU low-pass off).
+#                           /data/logs/euroc/config/voxl-gtsam-vio-server_euroc.yaml.
 #                           Default: the 11 sequences.
 #   VOXL    log<NNNN>       /data/logs/<log>/ (a voxl-logger log), the estimator and server configs of
 #                           this repository (config/estimator_mantis2.yaml, config/voxl-gtsam-vio-server.yaml),
@@ -75,7 +73,6 @@ BACKENDS="incremental keyframe"
 COOLDOWN=20
 OCV=""              # --opencv-threads, empty = the server config's value
 COV=""              # --covariance, empty = the server config's value
-LPF=""              # --imu-lowpass, empty = the server config's value
 REPLAY_TIMEOUT=900   # s, five times the longest log
 DRY=0
 SVCS="voxl-camera-server voxl-imu-server voxl-qvio-server voxl-open-vins-server"
@@ -89,7 +86,6 @@ while [[ $# -gt 0 ]]; do
     --cooldown) COOLDOWN="$2"; shift 2 ;;
     --opencv-threads) OCV="$2"; shift 2 ;;
     --covariance) COV="$2"; shift 2 ;;
-    --imu-lowpass) LPF="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     -h|--help) sed -n '2,/^# =====/p' "$0"; exit 0 ;;
     *) echo "ERROR: unknown option $1" >&2; exit 2 ;;
@@ -133,7 +129,6 @@ done
 for b in $BACKENDS; do [[ $b == incremental || $b == keyframe ]] || die "unknown backend $b"; done
 [[ -z $OCV || $OCV =~ ^-?[0-9]+$ ]] || die "--opencv-threads needs an integer"
 [[ -z $COV || $COV == async || $COV == inline ]] || die "--covariance needs async or inline"
-[[ -z $LPF || $LPF == on || $LPF == off ]] || die "--imu-lowpass needs on or off"
 tag() { [[ $1 == keyframe ]] && echo slks || echo isam2; }
 mkdir -p "$OUT"
 
@@ -163,12 +158,6 @@ make_cfgs() {
     else printf 'realtime:\n  async_covariance: %s\n' "$cv" >> "$d/server.yaml"; fi
     [[ $(grep -c "^  async_covariance: $cv\$" "$d/server.yaml") -eq 1 ]] || return 1
   fi
-  if [[ -n $LPF ]]; then       # imu_lowpass.enable, the only '  enable:' key of the server config
-    local lv=false; [[ $LPF == on ]] && lv=true
-    [[ $(grep -c '^imu_lowpass:' "$d/server.yaml") -eq 1 && $(grep -c '^  enable:' "$d/server.yaml") -eq 1 ]] || return 1
-    sed -i -E "/^  enable:/{s/^  enable:[^#]*(#.*)?\$/  enable: $lv \1/; s/ +\$//}" "$d/server.yaml"
-    [[ $(grep -cE "^  enable: $lv( #.*)?\$" "$d/server.yaml") -eq 1 ]] || return 1
-  fi
   # each rewrite landed exactly once, nothing else differs (estimator: the seed line added or replaced,
   # plus the backend line when it changed or lost its comment, server: only the four keys, which the
   # template may already hold, as the EuRoC template does for MH_01_easy's calibration)
@@ -177,7 +166,7 @@ make_cfgs() {
   local n v; n=$(diff "$E" "$d/estimator.yaml" | grep -c '^[<>]')
   [[ $n -ge 1 && $n -le 4 ]] || return 1
   [[ $(diff "$S" "$d/server.yaml" | grep '^[<>]' \
-        | grep -cvE '^[<>] ((estimator_config|intrinsics_file|extrinsics_file|log_dir|opencv_threads|  async_covariance|  enable): |realtime:$)') -eq 0 ]] || return 1
+        | grep -cvE '^[<>] ((estimator_config|intrinsics_file|extrinsics_file|log_dir|opencv_threads|  async_covariance): |realtime:$)') -eq 0 ]] || return 1
   for v in "estimator_config: $d/estimator.yaml" "intrinsics_file: $L/data/modalai/opencv_tracking_front_intrinsics.yml" \
            "extrinsics_file: $L/etc/modalai/extrinsics.conf" "log_dir: $d/srv"; do
     [[ $(grep -cxF "$v" "$d/server.yaml") -eq 1 ]] || return 1
@@ -276,7 +265,7 @@ if [[ $DRY -eq 0 ]]; then
     echo "governor $(sort /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | uniq -c | xargs)"
     echo "clk_tck $(getconf CLK_TCK)"
     echo "kernel $(uname -r), $(nproc) cores, $(free -m | awk '/^Mem/ {print $2}') MB"
-    echo "logs $LOG_LIST | seeds $SEEDS | backends $BACKENDS | cooldown $COOLDOWN s | opencv_threads ${OCV:-as in the server config} | covariance ${COV:-as in the server config} | imu_lowpass ${LPF:-as in the server config}"
+    echo "logs $LOG_LIST | seeds $SEEDS | backends $BACKENDS | cooldown $COOLDOWN s | opencv_threads ${OCV:-as in the server config} | covariance ${COV:-as in the server config}"
     echo "warm after each drop: $(wc -w <<< "$WARM") files ($(cat $WARM | wc -c) bytes), the server, voxl-replay and their libraries"
     echo "per run: drop_caches 3 and compact_memory before the server starts, up to 3 attempts after an infrastructure failure (failed attempts in ${FAILED})"
   } >> "$OUT/campaign.txt"

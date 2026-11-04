@@ -263,8 +263,7 @@ void MpaBridge::print_status() const {
     std::cout << "[status] imu " << (imu_connected_ ? "up" : "down") << " cam " << (cam_connected_ ? "up" : "down")
               << " | frames in " << s.frames_in << " out " << s.frames_out << " ok " << n_ok_
               << " kf " << s.keyframes << " dropped " << (s.dropped_backlog + s.dropped_no_imu)
-              << " resets " << s.resets << " | imu " << s.imu_in << " @ " << s.imu_rate_hz << " Hz, lpf delay "
-              << s.imu_tau_ms << " ms\n";
+              << " resets " << s.resets << " | imu " << s.imu_in << " rejected " << s.imu_rejected << "\n";
 }
 
 } // namespace gvio

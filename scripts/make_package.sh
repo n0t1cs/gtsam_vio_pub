@@ -2,7 +2,7 @@
 # make_package.sh: a .deb of the VOXL2 build (scripts/build_voxl2.sh), ModalAI-style.
 # STATUS: UNTESTED (see build_voxl2.sh).
 #   ./scripts/make_package.sh qrb5165|qrb5165-2
-# Installs: /usr/bin/{voxl-gtsam-vio-server,gvio-replay,gvio-engine-replay},
+# Installs: /usr/bin/{voxl-gtsam-vio-server,gvio-engine-replay},
 # /etc/modalai/voxl-gtsam-vio-server.yaml (kept on upgrade), /usr/share/voxl-gtsam-vio/estimator_mantis2.yaml,
 # /etc/systemd/system/voxl-gtsam-vio-server.service (NOT enabled: enable it by hand after a bench test).
 set -euo pipefail

@@ -8,12 +8,12 @@
 // callbacks in the server, or the replay harness) push raw IMU samples and camera frames from any
 // thread. Four threads do the rest, a fifth the keyframe covariances:
 //
-//   producer (IMU)    raw sample -> ImuFilter (the _lpf low-pass, online) -> IMU fifo
+//   producer (IMU)    raw sample -> IMU fifo (a stamp that does not increase is rejected)
 //   producer (camera) frame copy -> pending frames (bounded, drop oldest unless lockstep)
-//   sync              waits until the filtered IMU passes a frame's stamp, then hands every IMU
+//   sync              waits until the IMU passes a frame's stamp, then hands every IMU
 //                     sample up to that stamp to the front-end and the estimator BEFORE the frame,
 //                     undistorts it and queues it: the offline producer's order, exactly
-//   FrontendThread    the vendored KLT tracker, unchanged
+//   FrontendThread    the KLT tracker (estimator/frontend)
 //   estimator         main.cpp Phase 1 (init search, VINS-style defer-until-well-conditioned) and
 //                     Phase 3 (integrate_imu_batch, detect_stationary, add_frame) per frame, plus
 //                     the health checks and resets that an online system needs
@@ -21,13 +21,12 @@
 //                     window: one factorization per keyframe, queue bounded, drop oldest unless
 //                     lockstep. Nothing in the estimate depends on them.
 //
-// Given the same inputs the estimate is the offline one: same helpers (offline_helpers.cpp), same
-// call order, same RNG seeding, same covariance queries (README, Validation).
+// Given the same inputs the estimate was the offline one (V1): same helpers (offline_helpers.cpp),
+// same call order, same RNG seeding, same covariance queries (README, Validation).
 // =============================================================================
 #include "camera_model.h"
 #include "frame_queue.h"
 #include "frontend_thread.h"
-#include "imu_filter.h"
 #include "init_align.h"
 #include "init_buffer.h"
 #include "output_log.h"
@@ -69,7 +68,6 @@ struct EngineConfig {
     vio::VioParams P;              // the estimator config (config/estimator_mantis2.yaml)
     Undistorter    undistort;      // raw frame -> the pinhole camera of `calib`
     vio::CamCalib  calib;          // what the estimator sees (make_cam_calib)
-    ImuFilter::Params imu_filter;
 
     // real time
     bool   lockstep = false;           // replay harness: nothing is dropped, producers block
@@ -107,7 +105,7 @@ struct EngineOutput {
     Eigen::Matrix4d T_wb = Eigen::Matrix4d::Identity();   // IMU (= body) pose at this frame
     Eigen::Vector3d v_w  = Eigen::Vector3d::Zero();
     Eigen::Vector3d bg   = Eigen::Vector3d::Zero(), ba = Eigen::Vector3d::Zero();
-    Eigen::Vector3d w_body = Eigen::Vector3d::Zero();      // last filtered gyro minus bias
+    Eigen::Vector3d w_body = Eigen::Vector3d::Zero();      // last gyro sample minus bias
     // A keyframe's pose covariance, when runtime.dump_covariance: on the keyframe itself, or with
     // async_covariance on a later frame (the SLKS factorizes its window for it, on the covariance
     // thread). cov_R is the rotation of that keyframe, which the covariance's tangent refers to.
@@ -157,8 +155,7 @@ public:
     struct Stats {
         uint64_t imu_in = 0, imu_rejected = 0, frames_in = 0, frames_rejected = 0;
         uint64_t dropped_backlog = 0, dropped_no_imu = 0, frames_out = 0, keyframes = 0;
-        int init_attempts = 0, resets = 0, imu_gaps = 0;
-        double imu_rate_hz = 0.0, imu_tau_ms = 0.0;
+        int init_attempts = 0, resets = 0;
     };
     Stats stats() const;
     const EngineConfig& config() const { return cfg_; }
@@ -210,13 +207,11 @@ private:
     // producers -> sync
     mutable std::mutex m_;
     std::condition_variable cv_;
-    std::deque<vio::ImuSample> imu_fifo_;          // filtered, not yet handed out
-    int64_t last_imu_t_ = -1;                       // newest filtered stamp
+    std::deque<vio::ImuSample> imu_fifo_;          // not yet handed out
+    int64_t last_imu_t_ = -1;                       // newest IMU stamp
     std::deque<Pending> pending_;
     int64_t last_frame_t_ = -1;
     bool input_done_ = false, imu_done_ = false, stop_ = false;
-    mutable std::mutex imu_filter_m_;
-    ImuFilter imu_filter_;
     std::atomic<uint32_t> input_err_{0};
 
     // sync -> front-end -> estimator

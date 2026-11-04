@@ -14,16 +14,7 @@ undistort_balance: 0.0                   # the datasets' value (focal 389.0 px o
 pinhole_override: []                     # [fu, fv, cu, cv]: pin the virtual pinhole (parity tests).
                                          # Never leave a pin after recalibrating the camera.
 camera_time_offset_ns: 0                 # 0 = metadata stamp (start of exposure), as offline
-
-# The IMU low-pass of every mantis_qualisys_<log>_lpf dataset (Butterworth order 4 at 25 Hz, 16.6 ms
-# group delay, the IMU noise was calibrated on it). Off since 2026-11-02: the raw 1 kHz imu_apps,
-# behind the IMU chip's 92 Hz low-pass, lost no accuracy on either flight and cut the latency p50 by
-# 34 to 39 ms on the VOXL2.
-imu_lowpass:
-  enable: false
-  order: 4
-  cutoff_hz: 25.0
-  rate_hz: 0                             # 0 = measured from the first 1024 samples
+# The IMU is used raw: imu_apps at 1 kHz, behind the IMU chip's own 92 Hz low-pass.
 
 # Outputs, ModalAI's VIO interface. To fly on it, set vio_pipe in voxl-vision-hub.conf to
 # output_pipe (validate on the bench first, README.md).
@@ -31,7 +22,9 @@ output_pipe: gvio
 output_pipe_extended: gvio_extended
 soft_reset_keeps_frame: true             # an automatic reset continues the published frame
 
-opencv_threads: -1                       # OpenCV workers: -1 = OpenCV's default, 0 = none, n = n
+opencv_threads: 4                        # OpenCV workers: -1 = OpenCV's default (8 on the VOXL2),
+                                         # 0 = none, n = n. 4: server CPU 35 to 37 % lower than
+                                         # the default, latency p50 +5 ms, the same estimate
 
 realtime:
   max_pending_frames: 3                  # frames waiting for IMU coverage, oldest dropped beyond

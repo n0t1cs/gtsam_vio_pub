@@ -19,42 +19,19 @@ using gtsam::symbol_shorthand::V;
 using gtsam::symbol_shorthand::B;
 using gtsam::symbol_shorthand::L;
 
-using ProjFactor = gtsam::GenericProjectionFactor<gtsam::Pose3, gtsam::Point3, gtsam::Cal3_S2>;
-
-// 95% upper quantile of chi-square(k) via Wilson--Hilferty -- the within-95% NIS gate.
-static inline double chi2_p95(double k) {
-    const double a = 2.0 / (9.0 * k);
-    const double x = 1.0 - a + 1.6448536269514722 * std::sqrt(a);   // 1.6449 = z_{0.95}
-    return k * x * x * x;
-}
-
-// ISAM2 parameters for the incremental smoother. findUnusedFactorSlots MUST be
-// true: it lets removed-factor slots be reused, which is the precondition for
-// the smart-factor delete-and-re-add slot bookkeeping (Phase 0b). Without it,
-// nullptr slots accumulate and getISAM2Result().newFactorsIndices drifts.
-// relinearize_threshold / skip come from config. The threshold does not act as an
-// FEJ (threshold 0 changes nothing). iSAM2's FEJ-like behaviour is
-// its built-in marginal freeze (fixedVariables_).
-static gtsam::ISAM2Params make_isam2_params(double relin_threshold, int relin_skip,
-                                            const std::string& factorization) {
+// ISAM2 parameters for the incremental smoother. findUnusedFactorSlots: the slots of the factors
+// that marginalization removes are reused, so the factor list stays as long as the window (every
+// result since the smart-factor study ran with it). relinearize_threshold / skip come from config.
+// The threshold does not act as an FEJ (threshold 0 changes nothing). iSAM2's
+// FEJ-like behaviour is its built-in marginal freeze (fixedVariables_). CHOLESKY (GTSAM's default):
+// at the keyframe window it gives an estimate identical to QR on 11/11 EuRoC sequences at about a
+// quarter of the latency.
+static gtsam::ISAM2Params make_isam2_params(double relin_threshold, int relin_skip) {
     gtsam::ISAM2Params p;
     p.findUnusedFactorSlots = true;
     p.relinearizeThreshold  = relin_threshold;
     p.relinearizeSkip       = relin_skip;
-    // CHOLESKY (GTSAM's default) is what the committed configs select: at the
-    // keyframe window it gives an estimate identical to QR on 11/11 EuRoC sequences
-    // at about a quarter of the latency. QR stays
-    // the code default so earlier configs reproduce. It was adopted under the removed
-    // 3 s time window, where CHOLESKY let the accel bias absorb real acceleration on
-    // MH_04's fast end segment.
-    if (factorization == "cholesky") {
-        p.factorization = gtsam::ISAM2Params::CHOLESKY;
-    } else {
-        if (factorization != "qr")
-            std::cerr << "[VIO Backend] WARNING: isam_factorization='" << factorization
-                      << "' unknown; falling back to qr.\n";
-        p.factorization = gtsam::ISAM2Params::QR;
-    }
+    p.factorization         = gtsam::ISAM2Params::CHOLESKY;
     return p;
 }
 
@@ -77,31 +54,21 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
       state_idx_(0),
       initialized_(false) {
 
-    // Backend smoother: incremental (ISAM2, the committed default) or the
-    // KeyframeSmoother. The smart point backend requires the incremental one. The
-    // batch backend (BatchFixedLagSmoother) was removed on 2026-10-08 and is rejected
-    // by VioParams::load.
+    // Backend smoother: incremental (ISAM2, the committed default) or the KeyframeSmoother.
     if (params_.backend_mode == "incremental") {
         auto isam = std::make_unique<gtsam::IncrementalFixedLagSmoother>(
-            lag_,
-            make_isam2_params(params_.isam_relin_threshold, params_.isam_relin_skip,
-                              params_.isam_factorization));
-        isam_view_ = isam.get();          // non-owning view for getISAM2Result()/getFactors()
+            lag_, make_isam2_params(params_.isam_relin_threshold, params_.isam_relin_skip));
+        isam_view_ = isam.get();          // non-owning view for the covariances
         smoother_  = std::move(isam);
-        smart_mode_ = (params_.point_backend == "smart");
-        std::cout << "[VIO Backend] smoother = IncrementalFixedLagSmoother (ISAM2), factorization = "
-                  << (params_.isam_factorization == "cholesky" ? "CHOLESKY" : "QR") << "\n";
-        if (smart_mode_)
-            std::cout << "[VIO Backend] point_backend = smart (SmartProjectionPoseFactor)\n";
-    } else if (params_.backend_mode == "kf_fej" || params_.backend_mode == "keyframe") {
+        std::cout << "[VIO Backend] smoother = IncrementalFixedLagSmoother (ISAM2), factorization = CHOLESKY\n";
+    } else if (params_.backend_mode == "keyframe") {
         // The SLKS. STANDALONE keyframe-indexed fixed-lag smoother with
         // explicit Schur marginalization (keyframe_smoother.h) — NOT a
         // gtsam::FixedLagSmoother, so it is owned in its own pointer (kf_smoother_)
         // and smoother_ stays null; VioBackend drives both through run_update()/
         // run_estimate(). The window is N_kf keyframes, owned inside the smoother.
         // lag_ remains the back-end's OWN re-anchoring horizon (keyframe count), which
-        // matches the smoother's window by construction. Supports the inverse-depth and
-        // world point backends; smart requires incremental.
+        // matches the smoother's window by construction.
 
         // FEJ scope is a CALLER policy — the smoother is symbol-agnostic. Translate
         // the config string into a key predicate over our own symbol convention:
@@ -118,66 +85,27 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
                 return c == 'x' || c == 'v';
             };
 
-        const bool kf_use_gn = (params_.kf_optimizer == "gn");
         // Solve-guard: only LANDMARKS may be dropped when the window's linear system goes
         // indeterminate. A pose/velocity/bias degeneracy is a real failure and must NOT be
         // masked, so the predicate excludes them — the guard rethrows in that case.
         KeyframeSmoother::CullKeyFilter cull_filter =
             [](gtsam::Key k) { return gtsam::Symbol(k).chr() == 'l'; };
-        // S1 lever: square-root (QR) vs normal-equation (Cholesky) Schur marginalization.
-        const bool kf_qr_marg = (params_.kf_marg_elim == "qr");
-        if (params_.kf_marg_elim != "qr" && params_.kf_marg_elim != "cholesky")
-            std::cerr << "[VIO Backend] WARNING: kf_marg_elim='" << params_.kf_marg_elim
-                      << "' unknown; falling back to cholesky.\n";
         kf_smoother_ = std::make_unique<KeyframeSmoother>(params_.kf_window_size,
                                                           params_.kf_use_fej,
                                                           std::move(fej_filter),
                                                           params_.kf_max_iterations,
-                                                          kf_use_gn,
-                                                          std::move(cull_filter),
-                                                          kf_qr_marg);
-        if (params_.kf_diag_cond) {
-            kf_smoother_->setCondDiagnostics(true);
-            std::cout << "[VIO Backend] S2 conditioning diagnostic ON — dense SVD per "
-                         "marginalization; this run's timing is NOT Pareto-comparable.\n";
-        }
+                                                          std::move(cull_filter));
         std::cout << "[VIO Backend] smoother = KeyframeSmoother (standalone, keyframe window N_kf="
                   << params_.kf_window_size
                   << ", FEJ=" << (params_.kf_use_fej ? "on" : "off")
-                  << ", scope=" << params_.kf_fej_scope
-                  << ", opt=" << (kf_use_gn ? "GN" : "LM")
-                  << ", marg=" << (kf_qr_marg ? "QR" : "Cholesky") << ")\n";
-        if (params_.point_backend == "smart")
-            std::cerr << "[VIO Backend] WARNING: point_backend=smart needs backend_mode="
-                         "incremental; keyframe smoother stays on inverse-depth.\n";
+                  << ", scope=" << params_.kf_fej_scope << ", GN)\n";
     } else {
         throw std::invalid_argument("[VIO Backend] backend_mode='" + params_.backend_mode +
-                                    "' unknown (incremental | keyframe; batch was removed)");
+                                    "' unknown (incremental | keyframe)");
     }
     // Echo the window actually built, so a campaign can grep back that its config took.
     if (smoother_)
         std::cout << "[VIO Backend] fixed-lag window = keyframe index, lag=" << lag_ << " KF\n";
-
-    // World-frame point backend (L4 control): valid under every smoother, since it
-    // needs nothing from ISAM2. Mutually exclusive with smart by construction
-    // (both keyed off the same string).
-    world_mode_ = (params_.point_backend == "world");
-    if (world_mode_)
-        std::cout << "[VIO Backend] point_backend = world (Point3 + GenericProjectionFactor, "
-                     "no anchor, prior sigma " << params_.lm_world_prior_sigma_m << " m)\n";
-
-    // Smart-factor params (mono). Noise MUST be isotropic; outlier rejection is a
-    // SmartProjectionParams knob, not a robust kernel. HESSIAN linearization →
-    // RegularHessianFactor (ISAM2-friendly); ZERO_ON_DEGENERACY → empty factor on
-    // a still-untriangulable / degenerate track instead of crashing.
-    smart_noise_ = gtsam::noiseModel::Isotropic::Sigma(2, params_.smart_sigma_px);
-    smart_params_ = gtsam::SmartProjectionParams(gtsam::HESSIAN, gtsam::ZERO_ON_DEGENERACY,
-                                                 /*throwCheirality=*/false,
-                                                 /*verboseCheirality=*/false);
-    smart_params_.setRankTolerance(params_.smart_rank_tol);
-    smart_params_.setLandmarkDistanceThreshold(params_.smart_landmark_dist);
-    smart_params_.setRetriangulationThreshold(params_.smart_retriang_th);
-    smart_params_.setDynamicOutlierRejectionThreshold(params_.smart_outlier_px);
 
     // Camera calibration
     double fx = K(0, 0), fy = K(1, 1);
@@ -193,86 +121,16 @@ VioBackend::VioBackend(const Eigen::Matrix3d& K,
         gtsam::noiseModel::mEstimator::Huber::Create(params_.pt_huber_k),
         gtsam::noiseModel::Isotropic::Sigma(2, params_.pt_sigma_px));
 
-    // Landmark continuity (both off = the committed system; VioParams::load rejects
-    // unsupported combinations).
+    // Exact re-anchoring (landmark.reanchor: exact; VioParams::load rejects unsupported
+    // combinations).
     reanchor_exact_ = (params_.lm_reanchor == "exact");
-    if (reanchor_exact_)
+    if (reanchor_exact_) {
         reanchor_noise_ = gtsam::noiseModel::Isotropic::Sigma(3, params_.lm_reanchor_sigma);
-    if (reanchor_exact_ || params_.lm_init_current_obs)
         std::cout << "[VIO Backend] landmark continuity: reanchor=" << params_.lm_reanchor
-                  << " (sigma " << params_.lm_reanchor_sigma << ")  init_current_obs="
-                  << (params_.lm_init_current_obs ? "on" : "off")
+                  << " (sigma " << params_.lm_reanchor_sigma << ")"
                   << "  retire=" << (params_.lm_reanchor_retire ? "on" : "off")
                   << "  live_max=" << params_.lm_reanchor_live_max << "\n";
-
-    // Keyframe gating thresholds from config.
-    kf_parallax_px_  = params_.kf_parallax_px;
-    kf_min_tracked_  = params_.kf_min_tracked;
-    kf_max_interval_ = params_.kf_max_interval;
-    kf_w_t_          = params_.kf_shift_weight_t;
-    kf_w_r_          = params_.kf_shift_weight_r;
-    kf_w_rt_         = params_.kf_shift_weight_rt;
-    if (kf_w_t_ != 0.0 || kf_w_r_ != 0.0)
-        std::cout << "[VIO Backend] keyframe gate = DSO three-term flow score  w(T,R,RT)=("
-                  << kf_w_t_ << "," << kf_w_r_ << "," << kf_w_rt_ << ")  threshold="
-                  << kf_parallax_px_ << "px\n";
-}
-
-// Per-observation reprojection noise (heteroscedastic-covariance lever). OFF ->
-// the shared cam_noise_ (byte-identical). ON -> inflate sigma for young/short tracks
-// (age < age_full), which dominate fast-rotation sequences and drive the reprojection
-// over-confidence the OC + grid studies isolated to the measurement model. Not found
-// (age unknown) -> full trust.
-gtsam::SharedNoiseModel VioBackend::cam_noise_for(int64_t id) const {
-    if (!params_.pt_hetero_cov) return cam_noise_;
-    // Parallax is geometry-based and applied at the cross-view sites; here (anchor's
-    // own factor, or any id-only caller) it has no parallax -> baseline weight.
-    if (params_.pt_hetero_metric == "parallax") return cam_noise_;
-    auto it = obs_quality_.find(id);
-    const bool have = (it != obs_quality_.end());
-    double mult;
-    if (params_.pt_hetero_metric == "fb") {
-        // FB residual [px]: high (hard/fast-rotation tracking) -> inflate. Missing/fresh -> 0 -> full trust.
-        double fb = have ? it->second : 0.0;
-        mult = fb / params_.pt_hetero_fb_ref;
-    } else {
-        // Track age [frames]: young -> inflate. Missing -> age_full -> full trust.
-        double age = have ? it->second : params_.pt_hetero_age_full;
-        mult = params_.pt_hetero_age_full / std::max(age, 1.0);
     }
-    if (mult < 1.0) mult = 1.0;
-    if (mult > params_.pt_hetero_sigma_max) mult = params_.pt_hetero_sigma_max;
-    return gtsam::noiseModel::Robust::Create(
-        gtsam::noiseModel::mEstimator::Huber::Create(params_.pt_huber_k),
-        gtsam::noiseModel::Isotropic::Sigma(2, params_.pt_sigma_px * mult));
-}
-
-// Parallax metric: the anchor<->observer triangulation angle carries the depth
-// information of THIS cross-view factor. A small angle (low translational baseline,
-// e.g. fast pure rotation) means the observation barely constrains rho yet would be
-// weighted at full sigma_px -> over-confidence. Inflate below parallax_ref; a
-// well-translating view (large angle) stays at baseline, so healthy sequences are
-// left untouched -- the isolation that age (young-everywhere) and fb (gate-truncated)
-// could not achieve.
-gtsam::SharedNoiseModel VioBackend::cam_noise_parallax(double angle_deg) const {
-    double a = std::max(angle_deg, 1e-6);
-    double mult = params_.pt_hetero_parallax_ref / a;
-    if (mult < 1.0) mult = 1.0;
-    if (mult > params_.pt_hetero_sigma_max) mult = params_.pt_hetero_sigma_max;
-    return gtsam::noiseModel::Robust::Create(
-        gtsam::noiseModel::mEstimator::Huber::Create(params_.pt_huber_k),
-        gtsam::noiseModel::Isotropic::Sigma(2, params_.pt_sigma_px * mult));
-}
-
-// Angle [deg] subtended at world point Pw between the rays from two camera centers.
-static double parallax_angle_deg(const gtsam::Point3& Pw,
-                                 const gtsam::Point3& c0, const gtsam::Point3& c1) {
-    const gtsam::Vector3 r0 = Pw - c0, r1 = Pw - c1;
-    const double n0 = r0.norm(), n1 = r1.norm();
-    if (n0 < 1e-9 || n1 < 1e-9) return 0.0;
-    double c = r0.dot(r1) / (n0 * n1);
-    c = std::max(-1.0, std::min(1.0, c));
-    return std::acos(c) * 180.0 / M_PI;
 }
 
 // Backend dispatch. KeyframeSmoother owns a keyframe-indexed window; incremental is
@@ -356,18 +214,8 @@ void VioBackend::initialize_window(const std::vector<Eigen::Matrix4d>& T_wb,
                                    const std::vector<ImuSample>& imu,
                                    std::int64_t t0_ns) {
     const int N = (int)T_wb.size();
-    // Single-state seed instead of the continuous window, in two cases:
-    //   (a) the window is degenerate (too short / inconsistent) -- always;
-    //   (b) init.continuous_window == false -- ABLATION A5 (paper revision R1),
-    //       which reproduces the VINS-Mono handoff: the bootstrap is FROZEN at the
-    //       last keyframe and handed over as one hard-prior state, so the smoother
-    //       never re-optimizes the seed. This is the control arm that isolates the
-    //       continuous-window contribution.
-    if (!params_.init_continuous_window ||
-        N < 3 || (int)vels.size() != N || (int)frames.size() != N) {
-        if (!params_.init_continuous_window)
-            std::cout << "[initdiag] continuous_window=OFF -> frozen single-state seed "
-                         "at bootstrap KF " << (N > 0 ? N - 1 : 0) << " (ablation A5)\n";
+    // A degenerate window (too short / inconsistent) seeds a single state instead.
+    if (N < 3 || (int)vels.size() != N || (int)frames.size() != N) {
         initialize(T_wb.back(), vels.back(), bg, ba,
                    frames.empty() ? 0.0 : frames.back().t);
         return;
@@ -444,47 +292,7 @@ void VioBackend::initialize_window(const std::vector<Eigen::Matrix4d>& T_wb,
     gtsam::Vector3 floor_sig; floor_sig.setConstant(params_.lm_floor_prior_sigma);
     auto floor_noise = gtsam::noiseModel::Diagonal::Sigmas(floor_sig);
     int n_lm = 0;
-    // World-frame seeding (point_backend=world): the bootstrap map is ALREADY in
-    // world coordinates, so it drops straight in — no anchor pick, no inverse-depth
-    // conversion. Depth sanity is still checked from the newest observing view.
-    if (world_mode_) {
-        gtsam::Vector3 wp_sig; wp_sig.setConstant(params_.lm_world_prior_sigma_m);
-        auto wp_noise = gtsam::noiseModel::Diagonal::Sigmas(wp_sig);
-        for (auto& kv : obs_of) {
-            auto& views = kv.second;
-            if (views.size() < 2) continue;
-            int ai = 0;
-            for (size_t i = 1; i < views.size(); ++i)
-                if (views[i].first > views[ai].first) ai = (int)i;
-            const int a_idx = views[ai].first;
-
-            const int64_t fid = kv.first;
-            gtsam::Pose3 wTc_a(gtsam::Rot3(T_wb[a_idx].block<3, 3>(0, 0)),
-                               gtsam::Point3(T_wb[a_idx].block<3, 1>(0, 3)));
-            wTc_a = wTc_a.compose(body_P_cam_);
-            const gtsam::Point3 Pw(points.at(fid));
-            const gtsam::Point3 Pc = wTc_a.transformTo(Pw);
-            if (!(Pc.z() > 0.3 && Pc.z() < 40.0)) continue;
-
-            const gtsam::Key lk = L(next_lm_key_++);
-            lm_key_[fid] = gtsam::Symbol(lk).index();
-            const double w_a   = win_coord(a_idx);
-            lm_last_seen_[fid] = w_a;
-            landmarks_in_graph_.insert(fid);
-            initial_estimates_.insert(lk, Pw);
-            ts[lk] = w_a;
-
-            graph_.emplace_shared<gtsam::PriorFactor<gtsam::Point3>>(lk, Pw, wp_noise);
-            for (auto& v : views)
-                graph_.emplace_shared<ProjFactor>(
-                    gtsam::Point2(v.second(0), v.second(1)), cam_noise_,
-                    X(v.first), lk, calib_, body_P_cam_);
-            ++n_lm;
-        }
-    }
-    // smart mode seeds no explicit landmarks here; the online smart factors accrue
-    // structure once tracks reach 2 views (init window keeps IMU + gauge priors).
-    if (!smart_mode_ && !world_mode_) for (auto& kv : obs_of) {
+    for (auto& kv : obs_of) {
         auto& views = kv.second;
         if (views.size() < 2) continue;
         int ai = 0;
@@ -635,7 +443,6 @@ bool VioBackend::get_relative_pose_covariance(int ia, int ib,
 }
 
 bool VioBackend::covariance_snapshot(CovSnapshot& s) const {
-    if (smart_mode_) return false;
     if (isam_view_) {
         s.graph = isam_view_->getFactors();
         s.theta = isam_view_->getLinearizationPoint();
@@ -684,45 +491,6 @@ void VioBackend::add_imu(double dt, const Eigen::Vector3d& accel, const Eigen::V
     pim_->integrateMeasurement(accel, gyro, dt);
 }
 
-void VioBackend::get_landmarks_world(
-        std::unordered_map<int64_t, Eigen::Vector3d>& out) const {
-    out.clear();
-    // World mode: the landmark IS the world point — no anchor composition needed.
-    if (world_mode_) {
-        for (int64_t fid : landmarks_in_graph_) {
-            auto ik = lm_key_.find(fid);
-            if (ik == lm_key_.end()) continue;
-            const gtsam::Key lk = L(ik->second);
-            if (!latest_estimate_.exists(lk)) continue;
-            const gtsam::Point3 Pw = latest_estimate_.at<gtsam::Point3>(lk);
-            out[fid] = Eigen::Vector3d(Pw.x(), Pw.y(), Pw.z());
-        }
-        return;
-    }
-    for (int64_t fid : landmarks_in_graph_) {
-        auto ik = lm_key_.find(fid);
-        auto ia = lm_anchor_.find(fid);
-        if (ik == lm_key_.end() || ia == lm_anchor_.end()) continue;
-        gtsam::Key lk = L(ik->second);
-        gtsam::Key xa = X(ia->second);
-        if (!latest_estimate_.exists(lk) || !latest_estimate_.exists(xa)) continue;
-        gtsam::Vector3 l   = latest_estimate_.at<gtsam::Vector3>(lk);
-        gtsam::Pose3   wTc = latest_estimate_.at<gtsam::Pose3>(xa).compose(body_P_cam_);
-        gtsam::Point3  Pw  = wTc.transformFrom(invdepth_to_cam_point(l));
-        out[fid] = Eigen::Vector3d(Pw.x(), Pw.y(), Pw.z());
-    }
-}
-
-VioBackend::Diag VioBackend::get_diag() const {
-    Diag d;
-    if (latest_estimate_.exists(V(state_idx_)))
-        d.vel_norm = latest_estimate_.at<gtsam::Vector3>(V(state_idx_)).norm();
-    d.ba_norm       = current_bias_.accelerometer().norm();
-    d.bg_norm       = current_bias_.gyroscope().norm();
-    d.n_pts_graph   = smart_mode_ ? (int)sf_old_.size() : (int)landmarks_in_graph_.size();
-    return d;
-}
-
 gtsam::Pose3 VioBackend::get_pose_cached(int idx, const gtsam::Values& cache) const{
     if (idx == state_idx_) return initial_estimates_.at<gtsam::Pose3>(X(idx));
     return cache.at<gtsam::Pose3>(X(idx));
@@ -764,239 +532,8 @@ bool VioBackend::triangulate_dlt(int idx1, int idx2,
     const double zmin = params_.lm_tri_depth_min, zmax = params_.lm_tri_depth_max;
     if (!(z1 > zmin && z1 < zmax && z2 > zmin && z2 < zmax)) return false;
 
-    // landmark.min_parallax_deg: the angle the baseline subtends at the point, a scale-free
-    // version of the metric baseline gate above.
-    if (params_.lm_min_parallax_deg > 0.0) {
-        const Eigen::Vector3d r1 = X_w - pose1_wc.block<3, 1>(0, 3);
-        const Eigen::Vector3d r2 = X_w - pose2_wc.block<3, 1>(0, 3);
-        const double c = r1.dot(r2) / std::max(r1.norm() * r2.norm(), 1e-12);
-        const double ang_deg = std::acos(std::max(-1.0, std::min(1.0, c))) * 180.0 / M_PI;
-        if (ang_deg < params_.lm_min_parallax_deg) return false;
-    }
-
     X_w_out = X_w;
     return true;
-}
-
-// Smart-point path (point_backend=smart). Builds/extends SmartProjectionPoseFactors
-// from this keyframe's observations, then runs ONE incremental update that:
-//   - deletes the stale slot of every extended factor (factorsToRemove),
-//   - adds the new/cloned smart factors FIRST, then graph_ (IMU/ZUPT/prior),
-//   - reads each new smart factor's slot back from newFactorsIndices (1-to-1),
-//   - prunes factors that marginalized out (slot freed or reused).
-// Backup-and-restore wraps the update so a degenerate window cannot kill the run
-// (basic recovery; full prior-injection recovery is Phase 3).
-bool VioBackend::smart_point_update(
-        const std::unordered_map<int64_t, Eigen::Vector2d>& observations,
-        const gtsam::FixedLagSmoother::KeyTimestampMap& ts) {
-    std::vector<int64_t> staged_ids;        // push order -> maps 1-to-1 to newFactorsIndices
-    gtsam::NonlinearFactorGraph smart_new;  // staged smart factors, same order as staged_ids
-    gtsam::FactorIndices delete_slots;
-    const gtsam::NonlinearFactorGraph& fg = isam_view_->getFactors();
-
-    for (const auto& kv : observations) {
-        const int64_t fid = kv.first;
-        const gtsam::Point2 px(kv.second(0), kv.second(1));
-        auto it = sf_old_.find(fid);
-        if (it == sf_old_.end()) {
-            // Not yet a graph factor: buffer until we have >= 2 views (a 1-view
-            // smart factor is uninformative), then create with the full track.
-            auto& buf = sf_track_[fid];
-            buf.emplace_back(state_idx_, kv.second);
-            if (buf.size() < 2) continue;
-            auto f = boost::make_shared<SmartFactor>(smart_noise_, calib_, body_P_cam_, smart_params_);
-            for (const auto& o : buf) f->add(gtsam::Point2(o.second(0), o.second(1)), X(o.first));
-            sf_old_[fid] = {f, -1};
-            sf_track_.erase(fid);
-            smart_new.push_back(f);
-            staged_ids.push_back(fid);
-        } else {
-            // Existing factor: clone, append this observation, delete the old slot.
-            auto old  = it->second.first;
-            const int slot = it->second.second;
-            auto f = boost::make_shared<SmartFactor>(*old);
-            f->add(px, X(state_idx_));
-            if (slot >= 0 && fg.exists(slot) && fg.at(slot).get() == old.get())
-                delete_slots.push_back(slot);
-            it->second.first = f;          // slot refreshed after readback
-            smart_new.push_back(f);
-            staged_ids.push_back(fid);
-        }
-    }
-
-    // SMART FACTORS FIRST so the first staged_ids.size() newFactorsIndices are theirs.
-    gtsam::NonlinearFactorGraph nf;
-    nf.reserve(smart_new.size() + graph_.size());
-    nf.push_back(smart_new.begin(), smart_new.end());
-    nf.push_back(graph_.begin(), graph_.end());
-
-    gtsam::IncrementalFixedLagSmoother backup(*isam_view_);   // for recovery
-    try {
-        smoother_->update(nf, initial_estimates_, ts, delete_slots);
-    } catch (const std::exception& e) {
-        std::cerr << "[smart] update failed (" << e.what()
-                  << "); restoring and retrying without smart factors this KF.\n";
-        *isam_view_ = backup;
-        for (int64_t fid : staged_ids) sf_old_.erase(fid);   // drop uncommitted staging
-        try { smoother_->update(graph_, initial_estimates_, ts); }
-        catch (const std::exception& e2) {
-            std::cerr << "[smart] fallback update also failed: " << e2.what() << "\n";
-            return false;
-        }
-        return true;
-    }
-
-    // Slot readback (1-to-1 with the factors we pushed, in order).
-    const gtsam::ISAM2Result& res = isam_view_->getISAM2Result();
-    for (size_t i = 0; i < staged_ids.size(); ++i)
-        if (i < res.newFactorsIndices.size())
-            sf_old_[staged_ids[i]].second = (int)res.newFactorsIndices[i];
-
-    // Prune factors that marginalized out (slot freed, or reused by another factor).
-    const gtsam::NonlinearFactorGraph& fg2 = isam_view_->getFactors();
-    for (auto it = sf_old_.begin(); it != sf_old_.end(); ) {
-        const int slot = it->second.second;
-        if (slot < 0 || slot >= (int)fg2.size() ||
-            fg2.at(slot) == nullptr || fg2.at(slot).get() != it->second.first.get())
-            it = sf_old_.erase(it);
-        else ++it;
-    }
-    return true;
-}
-
-// World-frame point backend (point_backend=world) — the L4 control arm.
-//
-// Landmarks are world-frame Point3 variables observed through
-// GenericProjectionFactor, the OKVIS / SVO-pro homogeneous-point design (see
-// svo_ceres_backend/homogeneous_point_parameter_block.hpp). Because a landmark is
-// not expressed in any keyframe's camera, marginalizing a pose cannot orphan it:
-// the Schur complement absorbs that pose's projection factors into the marginal and
-// the landmark variable survives, carrying its accumulated information forward with
-// its correlations intact. That deletes the re-anchoring problem outright, instead
-// of paying for it the way VINS-Mono's removeBackShiftDepth does (which re-emits
-// measurements already inside the marginal — measured here as a 4.7x NEES cost).
-//
-// Consequence to watch: landmarks now persist for the whole life of a track, so the
-// marginal densifies over live landmarks rather than staying pose-sized. Cost is
-// per-keyframe solve time, which is the thing to measure against inverse depth.
-void VioBackend::world_point_update(
-        const std::unordered_map<int64_t, Eigen::Vector2d>& observations,
-        const gtsam::Values& current,
-        gtsam::FixedLagSmoother::KeyTimestampMap& ts,
-        double w,
-        std::vector<int64_t>& observed_points) {
-
-    const gtsam::Pose3 wTc_cur = get_pose_cached(state_idx_, current).compose(body_P_cam_);
-
-    auto pose_live = [&](int idx) {
-        auto it = state_time_.find(idx);
-        return it != state_time_.end()
-            && (w - it->second) < lag_
-            && current.exists(X(idx));
-    };
-
-    gtsam::Vector3 wp_sig; wp_sig.setConstant(params_.lm_world_prior_sigma_m);
-    auto wp_noise = gtsam::noiseModel::Diagonal::Sigmas(wp_sig);
-
-    for (const auto& kv : observations) {
-        const int64_t fid = kv.first;
-        const Eigen::Vector2d& uv = kv.second;
-
-        gtsam::Key lkey = 0;
-        bool usable = false;
-        if (landmarks_in_graph_.count(fid)) {
-            auto ik = lm_key_.find(fid);
-            auto is = lm_last_seen_.find(fid);
-            if (ik != lm_key_.end()) lkey = L(ik->second);
-            // The ONLY death condition is last-seen staleness (the smoother evicts
-            // the key on the same rule). There is no anchor to age out.
-            usable = ik != lm_key_.end()
-                  && latest_estimate_.exists(lkey)
-                  && is != lm_last_seen_.end() && (w - is->second) < lag_;
-            if (!usable) {
-                landmarks_in_graph_.erase(fid);
-                lm_last_seen_.erase(fid);
-                lm_key_.erase(fid);
-                feature_obs_.erase(fid);
-            }
-        }
-
-        if (usable) {
-            // Per-observation dynamic rejection (Kimera outlierRejection analog),
-            // straight off the world point — no anchor lookup needed.
-            if (params_.pt_obs_reject_px > 0.0) {
-                const gtsam::Point3 Pc =
-                    wTc_cur.transformTo(latest_estimate_.at<gtsam::Point3>(lkey));
-                bool reject = Pc.z() <= 0.0;   // behind camera
-                if (!reject) {
-                    const gtsam::Point2 pred = calib_->uncalibrate(
-                        gtsam::Point2(Pc.x() / Pc.z(), Pc.y() / Pc.z()));
-                    reject = (pred - gtsam::Point2(uv(0), uv(1))).norm()
-                             > params_.pt_obs_reject_px;
-                }
-                if (reject) { ++pt_obs_rejected_; continue; }
-            }
-            graph_.emplace_shared<ProjFactor>(gtsam::Point2(uv(0), uv(1)), cam_noise_,
-                                              X(state_idx_), lkey, calib_, body_P_cam_);
-            ts[lkey] = w;
-            lm_last_seen_[fid] = w;
-            observed_points.push_back(fid);
-            continue;
-        }
-
-        // --- delayed initialization (same gates as the inverse-depth path) ---
-        feature_obs_[fid].emplace_back(state_idx_, uv);
-        auto& vec = feature_obs_[fid];
-
-        if (vec.size() >= 2) {
-            std::vector<std::pair<int, Eigen::Vector2d>> live;
-            live.reserve(vec.size());
-            for (const auto& o : vec)
-                if (pose_live(o.first)) live.push_back(o);
-
-            if (live.size() >= 2) {
-                Eigen::Vector3d X_w;
-                // baseline gate inside triangulate_dlt self-delays under low parallax
-                if (triangulate_dlt(live.front().first, live.back().first,
-                                    live.front().second, live.back().second,
-                                    current, X_w)) {
-                    bool all_ok = true;
-                    for (const auto& o : live) {
-                        const double z = get_pose_cached(o.first, current)
-                                             .compose(body_P_cam_)
-                                             .transformTo(gtsam::Point3(X_w)).z();
-                        if (!(z > params_.lm_depth_min && z < params_.lm_depth_max)) {
-                            all_ok = false; break;
-                        }
-                    }
-                    if (all_ok) {
-                        const gtsam::Point3 Pw(X_w);
-                        const gtsam::Key lk = L(next_lm_key_++);
-                        lm_key_[fid]       = gtsam::Symbol(lk).index();
-                        landmarks_in_graph_.insert(fid);
-                        lm_last_seen_[fid] = w;
-                        initial_estimates_.insert(lk, Pw);
-                        ts[lk]             = w;
-                        observed_points.push_back(fid);
-
-                        // Weak world-frame prior: the XYZ analog of the inverse-depth
-                        // floor prior. World points have no anchor to regularize them,
-                        // so this is what stands between a low-parallax track and the
-                        // IndeterminantLinearSystem that killed the smart-factor path.
-                        graph_.emplace_shared<gtsam::PriorFactor<gtsam::Point3>>(
-                            lk, Pw, wp_noise);
-                        for (const auto& o : live)
-                            graph_.emplace_shared<ProjFactor>(
-                                gtsam::Point2(o.second(0), o.second(1)), cam_noise_,
-                                X(o.first), lk, calib_, body_P_cam_);
-                        feature_obs_.erase(fid);
-                    }
-                }
-            }
-        } else if (vec.size() > 15) {
-            feature_obs_.erase(fid);
-        }
-    }
 }
 
 bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& observations,
@@ -1085,13 +622,6 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
     //    anchor ages out it is dropped and (if still tracked) re-anchored by
     //    re-initialization at a current keyframe.
     // ---------------------------------------------------------------
-    // point_backend=smart handles points via smart_point_update() below; skip the
-    // explicit inverse-depth construction entirely in that mode.
-    // In-graph point landmarks touched this keyframe (for the post-update depth cull).
-    std::vector<int64_t> observed_points;
-    // point_backend=world runs its own (much simpler) landmark path: no anchor, so
-    // no re-anchoring, no depth transfer, no abandon-on-anchor-death.
-    if (world_mode_) world_point_update(observations, current, ts, w, observed_points);
     // Live re-anchor chains (landmark.reanchor_live_max). A chain is live while its track is
     // fresh. A track that simply ends keeps its entry, so stale entries are pruned here, which
     // changes nothing else: a stale track can only be abandoned.
@@ -1102,11 +632,8 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
             if (is == lm_last_seen_.end() || (w - is->second) >= lag_) it = lm_chain_reanchors_.erase(it);
             else { ++live_chains; ++it; }
         }
-        lm_live_sum_ += live_chains;
-        ++lm_live_n_;
-        lm_live_peak_ = std::max(lm_live_peak_, live_chains);
     }
-    if (!smart_mode_ && !world_mode_) for (const auto& kv : observations) {
+    for (const auto& kv : observations) {
         int64_t fid = kv.first;
         const Eigen::Vector2d& uv = kv.second;
 
@@ -1136,21 +663,16 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                 // landmark that went stale through repeated rejection is abandoned as
                 // before. The outgoing anchor is still in `current` (the back-end stops
                 // using a pose one keyframe before the smoother evicts it).
-                // landmark.reanchor_max: a chain that already carries the cap of re-anchors
-                // falls back to abandon, and the track starts a fresh chain when re-triangulated.
                 // landmark.reanchor_live_max: when the live chains fill the cap, an exit that
                 // would start a chain falls back to abandon. Running chains continue.
                 const auto ich = lm_chain_reanchors_.find(fid);
                 const int chain_n = (ich != lm_chain_reanchors_.end()) ? ich->second : 0;
-                const bool capped = params_.lm_reanchor_max > 0 && chain_n >= params_.lm_reanchor_max;
                 const bool full = params_.lm_reanchor_live_max > 0 && chain_n == 0
                                   && live_chains >= params_.lm_reanchor_live_max;
                 const bool exit_fresh = reanchor_exact_ && anchor >= 0 && lkey != 0
                     && latest_estimate_.exists(lkey) && current.exists(X(anchor))
                     && is != lm_last_seen_.end() && (w - is->second) < lag_;
-                if (exit_fresh && capped) ++lm_reanchor_capped_;   // falls through to abandon
-                if (exit_fresh && full)   ++lm_reanchor_full_;     // falls through to abandon
-                if (exit_fresh && !capped && !full) {
+                if (exit_fresh && !full) {
                     const gtsam::Vector3 l_old = latest_estimate_.at<gtsam::Vector3>(lkey);
                     const gtsam::Pose3 wTc_a =
                         current.at<gtsam::Pose3>(X(anchor)).compose(body_P_cam_);
@@ -1179,7 +701,6 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                         lm_last_seen_[fid] = w;
                         initial_estimates_.insert(lk, l_new);
                         ts[lk] = w;
-                        observed_points.push_back(fid);
                         graph_.emplace_shared<InvDepthReanchorFactor>(
                             lkey, X(anchor), X(state_idx_), lk, body_P_cam_, reanchor_noise_);
                         // landmark.reanchor_retire: the old variable leaves with its anchor.
@@ -1187,96 +708,13 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                         // the new anchor's own measurement: a new pixel, used once
                         graph_.emplace_shared<InvDepthAnchorFactor>(
                             X(state_idx_), lk, gtsam::Point2(uv(0), uv(1)),
-                            body_P_cam_, calib_, cam_noise_for(fid));
-                        ++lm_reanchored_;
+                            body_P_cam_, calib_, cam_noise_);
                         if (chain_n == 0) ++live_chains;
                         lm_chain_reanchors_[fid] = chain_n + 1;
                         continue;
                     }
-                    ++lm_reanchor_declined_;   // falls through to abandon
+                    // otherwise falls through to abandon
                 }
-
-                // DEPTH TRANSFER (VINS-Mono FeatureManager::removeBackShiftDepth
-                // analog). The anchor is leaving the window, but the landmark's depth
-                // has been refined over the whole window — re-express it in the NEW
-                // anchor camera instead of throwing it away and waiting for a fresh
-                // 2-view triangulation (which also leaves the track contributing
-                // nothing in the meantime). The outgoing anchor is still present in
-                // `current`: the back-end stops using a pose one keyframe BEFORE the
-                // smoother evicts it, so its pose is available for the transfer.
-                bool transferred = false;
-                if (params_.pt_depth_transfer && anchor >= 0 && lkey != 0
-                    && latest_estimate_.exists(lkey) && current.exists(X(anchor))) {
-                    // Surviving views of this landmark. The retained history holds
-                    // past keyframes; this keyframe's own observation is appended
-                    // explicitly because X(state_idx_) is not in `current` yet and
-                    // so pose_live() rejects it.
-                    std::vector<std::pair<int, Eigen::Vector2d>> live;
-                    auto ih = feature_obs_.find(fid);
-                    if (ih != feature_obs_.end())
-                        for (const auto& o : ih->second)
-                            if (pose_live(o.first)) live.push_back(o);
-                    live.emplace_back(state_idx_, uv);
-
-                    // New host: oldest surviving view (VINS shifts frame 1 -> 0),
-                    // i.e. the largest remaining baseline. `live` always holds this
-                    // keyframe, so front()/back() are safe here.
-                    const auto& a_obs =
-                        params_.pt_depth_transfer_oldest ? live.front() : live.back();
-                    const int a_new = a_obs.first;
-
-                    // Two ways to decline the transfer:
-                    //  <2 views  — VINS erases such a feature (feature_per_frame.size()
-                    //    < 2). One view leaves rho UNOBSERVED, since
-                    //    InvDepthAnchorFactor constrains only (theta,phi); the depth
-                    //    would hang on the weak floor prior alone.
-                    //  a_new == anchor — pure churn: the old key marginalizes and the
-                    //    new one re-asserts the same estimate on the same pose, with no
-                    //    geometry gained. Reachable only when !usable came from
-                    //    last-seen staleness rather than the anchor dying.
-                    if (live.size() >= 2 && a_new != anchor) {
-                        const gtsam::Vector3 l_old = latest_estimate_.at<gtsam::Vector3>(lkey);
-                        const gtsam::Pose3 wTc_old =
-                            current.at<gtsam::Pose3>(X(anchor)).compose(body_P_cam_);
-                        const gtsam::Pose3 wTc_new =
-                            get_pose_cached(a_new, current).compose(body_P_cam_);
-                        const gtsam::Point3 Pw =
-                            wTc_old.transformFrom(invdepth_to_cam_point(l_old));
-                        const gtsam::Point3 Pc_new = wTc_new.transformTo(Pw);
-                        if (Pc_new.z() > params_.lm_depth_min && Pc_new.z() < params_.lm_depth_max) {
-                            const gtsam::Vector3 l_new = cam_point_to_invdepth(Pc_new);
-                            const gtsam::Key lk = L(next_lm_key_++);   // fresh key, new anchor frame
-                            lm_key_[fid]       = gtsam::Symbol(lk).index();
-                            lm_anchor_[fid]    = a_new;
-                            lm_last_seen_[fid] = w;
-                            initial_estimates_.insert(lk, l_new);
-                            ts[lk] = w;
-                            observed_points.push_back(fid);
-                            feature_obs_[fid] = live;   // carry history to the next re-host
-
-                            gtsam::Vector3 floor_sig;
-                            floor_sig.setConstant(params_.lm_floor_prior_sigma);
-                            graph_.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
-                                lk, l_new, gtsam::noiseModel::Diagonal::Sigmas(floor_sig));
-                            // new anchor's own measurement constrains (theta,phi)
-                            graph_.emplace_shared<InvDepthAnchorFactor>(
-                                X(a_new), lk, gtsam::Point2(a_obs.second(0), a_obs.second(1)),
-                                body_P_cam_, calib_, cam_noise_);
-                            // every OTHER surviving view constrains rho — VINS
-                            // re-emits all remaining residuals against the new host.
-                            for (const auto& o : live) {
-                                if (o.first == a_new) continue;
-                                graph_.emplace_shared<InvDepthProjFactor>(
-                                    X(a_new), X(o.first), lk,
-                                    gtsam::Point2(o.second(0), o.second(1)),
-                                    body_P_cam_, calib_, cam_noise_);
-                            }
-                            ++pt_depth_transferred_;
-                            transferred = true;
-                        }
-                    }
-                }
-                if (transferred) continue;   // re-anchored in place; keep the track alive
 
                 // anchor (or landmark) aged out -> ABANDON the old key (it will
                 // marginalize on its own) and re-anchor via re-initialization
@@ -1312,38 +750,14 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                     reject = (pred - gtsam::Point2(uv(0), uv(1))).norm()
                              > params_.pt_obs_reject_px;
                 }
-                if (reject) { ++pt_obs_rejected_; continue; }
+                if (reject) continue;
             }
             // cross-view: anchor + current keyframe observe the same inv-depth lm
-            gtsam::SharedNoiseModel nm = cam_noise_for(fid);
-            if (params_.pt_hetero_cov && params_.pt_hetero_metric == "parallax") {
-                const gtsam::Vector3 l  = latest_estimate_.at<gtsam::Vector3>(lkey);
-                const gtsam::Pose3 wTc_a = get_pose_cached(anchor, current).compose(body_P_cam_);
-                const gtsam::Point3 Pw  = wTc_a.transformFrom(invdepth_to_cam_point(l));
-                const gtsam::Point3 c1  = get_pose_cached(state_idx_, current)
-                                              .compose(body_P_cam_).translation();
-                nm = cam_noise_parallax(parallax_angle_deg(Pw, wTc_a.translation(), c1));
-            }
             graph_.emplace_shared<InvDepthProjFactor>(
                 X(anchor), X(state_idx_), lkey,
-                gtsam::Point2(uv(0), uv(1)), body_P_cam_, calib_, nm);
+                gtsam::Point2(uv(0), uv(1)), body_P_cam_, calib_, cam_noise_);
             ts[lkey] = w;
             lm_last_seen_[fid] = w;
-            observed_points.push_back(fid);
-            // Retain the observation history of an IN-GRAPH landmark (pruned to
-            // live poses, so it stays window-bounded). VINS's FeatureManager keeps
-            // every view of every feature; we normally discard them at delayed init,
-            // which is what left the old transfer with a single, rho-blind view.
-            // Only while the transfer is enabled -> the flag-off path is unchanged.
-            if (params_.pt_depth_transfer) {
-                auto& hist = feature_obs_[fid];
-                hist.erase(std::remove_if(hist.begin(), hist.end(),
-                                          [&](const std::pair<int, Eigen::Vector2d>& o) {
-                                              return !pose_live(o.first);
-                                          }),
-                           hist.end());
-                hist.emplace_back(state_idx_, uv);
-            }
             continue;
         }
 
@@ -1387,7 +801,6 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                         lm_anchor_[fid]    = a_idx;
                         lm_last_seen_[fid] = w;
                         ts[lk]             = w;
-                        observed_points.push_back(fid);   // fresh lm joins the post-update cull
 
                         // Weak per-component FLOOR prior in inverse-depth coords
                         // (theta,phi in rad, rho in 1/m) — only a numerical
@@ -1400,57 +813,17 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
                         // anchor's own measurement constrains (theta,phi)
                         graph_.emplace_shared<InvDepthAnchorFactor>(
                             X(a_idx), lk, gtsam::Point2(a_uv(0), a_uv(1)),
-                            body_P_cam_, calib_, cam_noise_for(fid));
+                            body_P_cam_, calib_, cam_noise_);
 
                         // cross-view factors (these constrain rho)
                         for (const auto& obs : live) {
                             if (obs.first == a_idx) continue;
-                            gtsam::SharedNoiseModel nm = cam_noise_for(fid);
-                            if (params_.pt_hetero_cov && params_.pt_hetero_metric == "parallax") {
-                                const gtsam::Point3 c1 = get_pose_cached(obs.first, current)
-                                                             .compose(body_P_cam_).translation();
-                                nm = cam_noise_parallax(parallax_angle_deg(
-                                        gtsam::Point3(X_w), wTc_a.translation(), c1));
-                            }
                             graph_.emplace_shared<InvDepthProjFactor>(
                                 X(a_idx), X(obs.first), lk,
                                 gtsam::Point2(obs.second(0), obs.second(1)),
-                                body_P_cam_, calib_, nm);
+                                body_P_cam_, calib_, cam_noise_);
                         }
-                        // landmark.init_current_obs: this keyframe's own view. It is not in
-                        // `live` (X(state_idx_) is not in `current` yet) and is erased with
-                        // the history below, so without this it is never used. The pose is
-                        // inserted in this same update, so the factor is legal. Same gate
-                        // as a re-observation.
-                        if (params_.lm_init_current_obs && a_idx != state_idx_) {
-                            const gtsam::Pose3 wTc_o =
-                                get_pose_cached(state_idx_, current).compose(body_P_cam_);
-                            const gtsam::Point3 Pc_o = wTc_o.transformTo(gtsam::Point3(X_w));
-                            bool reject = Pc_o.z() <= 0.0;
-                            if (!reject && params_.pt_obs_reject_px > 0.0) {
-                                const gtsam::Point2 pred = calib_->uncalibrate(
-                                    gtsam::Point2(Pc_o.x() / Pc_o.z(), Pc_o.y() / Pc_o.z()));
-                                reject = (pred - gtsam::Point2(uv(0), uv(1))).norm()
-                                         > params_.pt_obs_reject_px;
-                            }
-                            if (reject) {
-                                ++lm_init_obs_rejected_;
-                            } else {
-                                gtsam::SharedNoiseModel nm = cam_noise_for(fid);
-                                if (params_.pt_hetero_cov && params_.pt_hetero_metric == "parallax")
-                                    nm = cam_noise_parallax(parallax_angle_deg(
-                                            gtsam::Point3(X_w), wTc_a.translation(),
-                                            wTc_o.translation()));
-                                graph_.emplace_shared<InvDepthProjFactor>(
-                                    X(a_idx), X(state_idx_), lk,
-                                    gtsam::Point2(uv(0), uv(1)), body_P_cam_, calib_, nm);
-                                ++lm_init_obs_added_;
-                            }
-                        }
-                        // Keep the views that built this landmark when the transfer
-                        // is on, so its first re-host has a full history.
-                        if (params_.pt_depth_transfer) feature_obs_[fid] = live;
-                        else                           feature_obs_.erase(fid);
+                        feature_obs_.erase(fid);
                     }
                 }
             }
@@ -1460,67 +833,9 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
     }
 
     // ---------------------------------------------------------------
-    // 4b. NIS metric A -- reprojection PRE-FIT innovation (GT-free consistency).
-    //     Evaluate each existing-landmark observation of THIS keyframe at the PRIOR:
-    //     obs pose = IMU prediction (nav_pred), anchor + landmark at their window
-    //     estimates. graph_ here holds ONLY this KF's new factors (cleared post-update),
-    //     so an InvDepthProjFactor with obs pose == X(state_idx_) and anchor != X(state_idx_)
-    //     is exactly a re-observation of a landmark that already had a prior.
-    //     S = H_obs P- H_obs^T + sigma_px^2 I -- POSE-ONLY innovation covariance (anchor and
-    //     inverse-depth uncertainty omitted -> S understated -> NIS_A biased high). P- is the
-    //     previous pose marginal propagated through the IMU relative motion (EKF predict).
-    //     invdepth mode only (smart/world excluded); gated on dump_covariance and nis_prefit.
-    if (params_.dump_covariance && params_.nis_prefit && !smart_mode_ && !world_mode_) {
-        Eigen::Matrix<double, 6, 6> P_prev;
-        if (get_pose_covariance(prev_idx, P_prev)) {
-            const gtsam::Pose3 T_prev = current.at<gtsam::Pose3>(X(prev_idx));
-            const gtsam::Pose3 T_pred = nav_pred.pose();
-            const gtsam::Pose3 dT = T_prev.inverse().compose(T_pred);
-            Eigen::Matrix<double, 6, 6> Hc1, Hc2;
-            T_prev.compose(dT, Hc1, Hc2);                          // T_pred = T_prev o dT
-            const Eigen::Matrix<double, 6, 6> Q_dT =
-                pim_->preintMeasCov().block<6, 6>(0, 0);           // [rot,trans] rel-pose cov
-            const Eigen::Matrix<double, 6, 6> P_minus =
-                Hc1 * P_prev * Hc1.transpose() + Hc2 * Q_dT * Hc2.transpose();
-            const double R = params_.pt_sigma_px * params_.pt_sigma_px;
-
-            gtsam::Values prior_vals = current;
-            prior_vals.insert(X(state_idx_), T_pred);
-
-            double nis_sum = 0.0; int dof = 0;
-            for (const auto& f : graph_) {
-                auto* pf = dynamic_cast<const InvDepthProjFactor*>(f.get());
-                if (!pf) continue;
-                const gtsam::Key ka = pf->keys()[0], ko = pf->keys()[1], kl = pf->keys()[2];
-                if (ko != X(state_idx_) || ka == X(state_idx_)) continue;  // existing landmarks only
-                if (!prior_vals.exists(ka) || !prior_vals.exists(kl)) continue;
-                gtsam::Matrix H1, H2, H3;
-                const gtsam::Vector r = pf->evaluateError(
-                    prior_vals.at<gtsam::Pose3>(ka), prior_vals.at<gtsam::Pose3>(ko),
-                    prior_vals.at<gtsam::Vector3>(kl), H1, H2, H3);
-                const Eigen::Matrix2d S =
-                    H2 * P_minus * H2.transpose() + R * Eigen::Matrix2d::Identity();
-                nis_sum += r.dot(S.inverse() * r);
-                dof += 2;
-            }
-            if (dof > 0) {
-                nis_a_ndof_.push_back(nis_sum / dof);
-                nis_a_gate_.push_back(nis_sum < chi2_p95(dof) ? 1.0 : 0.0);
-            }
-        }
-    }
-
+    // 5. Fixed-lag update (GN/ISAM2 over the window; marginalizes old keys)
     // ---------------------------------------------------------------
-    // 5. Fixed-lag update (LM/ISAM2 over the window; marginalizes old keys)
-    //    smart mode: smart_point_update() prepends the smart factors and runs the
-    //    delete-old/add-new update with slot bookkeeping; else the plain update of
-    //    graph_ (IMU/ZUPT/invdepth factors).
-    // ---------------------------------------------------------------
-    if (smart_mode_) {
-        smart_point_update(observations, ts);
-    } else {
-        run_update(graph_, initial_estimates_, ts);
-    }
+    run_update(graph_, initial_estimates_, ts);
 
     // ---------------------------------------------------------------
     // 6. Refresh bias from the new estimate, reset preintegrator.
@@ -1529,36 +844,6 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
     const gtsam::imuBias::ConstantBias new_bias =
         post_update.at<gtsam::imuBias::ConstantBias>(B(state_idx_));
 
-    // --- IMU preintegration-length diagnostic (read-only; pim_ still holds [prev,cur]) ---
-    // nav_pred (computed above) is the prediction at biasHat = current_bias_; re-predict
-    // from the SAME nav_prev at the optimized bias and measure the endpoint shift. That
-    // shift IS the first-order bias correction the CombinedImuFactor applies over this
-    // interval -- the only term whose accuracy degrades as the interval lengthens.
-    {
-        const gtsam::NavState pred_opt = pim_->predict(nav_prev, new_bias);
-        imu_dt_.push_back(pim_->deltaTij());
-        imu_bcorr_pos_.push_back((pred_opt.position() - nav_pred.position()).norm());
-        imu_bcorr_rot_.push_back(
-            gtsam::Rot3::Logmap(nav_pred.attitude().between(pred_opt.attitude())).norm()
-            * 180.0 / M_PI);
-        const Eigen::Matrix<double, 15, 15> C = pim_->preintMeasCov();  // [theta,pos,vel,bias]
-        imu_cov_rot_.push_back(std::sqrt(C.block<3, 3>(0, 0).trace()) * 180.0 / M_PI);  // deg
-        imu_cov_pos_.push_back(std::sqrt(C.block<3, 3>(3, 3).trace()));                 // m
-
-        // NIS metric B: IMU-prediction pose innovation (dof 6). nu = Log(T_pred^-1 T_opt)
-        // between the IMU-predicted prior pose and the optimized posterior; S = preintMeasCov
-        // pose block. Caveat: prior and posterior share the graph -> correlated -> optimistic
-        // (an IMU-consistency indicator, not an independent innovation).
-        if (params_.dump_covariance) {
-            const gtsam::Pose3 T_opt = post_update.at<gtsam::Pose3>(X(state_idx_));
-            const gtsam::Vector6 nu =
-                gtsam::Pose3::Logmap(nav_pred.pose().inverse().compose(T_opt));
-            const Eigen::Matrix<double, 6, 6> S = C.block<6, 6>(0, 0);
-            const double nis_b = nu.dot(S.inverse() * nu);
-            nis_b_ndof_.push_back(nis_b / 6.0);
-            nis_b_gate_.push_back(nis_b < chi2_p95(6.0) ? 1.0 : 0.0);
-        }
-    }
     // Bias sanity clamp (VINS failureDetection-style, but non-destructive). A
     // physical MEMS bias is tiny; if the incremental solve returns a non-physical
     // bias it is diverging (accel bias absorbs real acceleration -> pim predicts a
@@ -1579,73 +864,6 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
     }
     pim_->resetIntegrationAndSetBias(current_bias_);
     latest_estimate_ = post_update;
-
-    // --- Post-fit reprojection residual diagnostic (vision-side covariance) ---
-    // Evaluate THIS KF's reprojection factors at the OPTIMIZED pose. graph_ still holds
-    // them (cleared later). raw RMS[px] tells whether sigma_px matches the data; the
-    // R-normalized chi2 (target ~1) separates sigma_px mis-specification from visual
-    // information over-counting. invdepth mode only; gated on dump_covariance.
-    if (params_.dump_covariance && !smart_mode_ && !world_mode_) {
-        double sse = 0.0; int nobs = 0;
-        for (const auto& f : graph_) {
-            auto* pf = dynamic_cast<const InvDepthProjFactor*>(f.get());
-            if (!pf) continue;
-            const gtsam::Key ka = pf->keys()[0], ko = pf->keys()[1], kl = pf->keys()[2];
-            if (!post_update.exists(ka) || !post_update.exists(ko) || !post_update.exists(kl)) continue;
-            const gtsam::Vector r = pf->evaluateError(post_update.at<gtsam::Pose3>(ka),
-                post_update.at<gtsam::Pose3>(ko), post_update.at<gtsam::Vector3>(kl));
-            sse += r.squaredNorm(); nobs += 1;
-        }
-        if (nobs > 0) {
-            const double sp = params_.pt_sigma_px;
-            reproj_rms_.push_back(std::sqrt(sse / (2.0 * nobs)));          // px RMS / component
-            reproj_chi2_.push_back(sse / (sp * sp) / (2.0 * nobs));        // ~1 if sigma_px calibrated
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // 6a. Post-solve point-landmark depth cull (VINS-Mono setDepth/removeFailures
-    //     analog): entry gates catch bad TRIANGULATIONS; this catches landmarks
-    //     the OPTIMIZER drove bad. A landmark whose inverse depth went
-    //     non-positive, or whose depth left [min,max] m, stops receiving factors
-    //     and marginalizes out by lag (the fixed-lag analog of VINS erasing it).
-    if ((params_.pt_cull_depth_min > 0.0 || params_.pt_cull_depth_max > 0.0)
-        && !observed_points.empty()) {
-        for (int64_t fid : observed_points) {
-            auto ik = lm_key_.find(fid);
-            if (ik == lm_key_.end()) continue;
-            gtsam::Key lk = L(ik->second);
-            if (!post_update.exists(lk)) continue;
-            // Depth means different things per parametrization: inverse depth is
-            // 1/rho in the ANCHOR camera; a world point has to be projected into the
-            // CURRENT camera. gtsam::Point3 and gtsam::Vector3 are the same Eigen
-            // type, so reading the wrong one silently yields garbage — branch.
-            double depth;
-            if (world_mode_) {
-                const gtsam::Pose3 wTc =
-                    post_update.at<gtsam::Pose3>(X(state_idx_)).compose(body_P_cam_);
-                depth = wTc.transformTo(post_update.at<gtsam::Point3>(lk)).z();
-            } else {
-                const gtsam::Vector3 l = post_update.at<gtsam::Vector3>(lk);
-                const double rho = l(2);
-                depth = (rho > 1e-9) ? 1.0 / rho : -1.0;
-            }
-            bool bad = depth <= 0.0;   // behind anchor / at-infinity wrong side
-            if (!bad && params_.pt_cull_depth_min > 0.0
-                     && depth < params_.pt_cull_depth_min) bad = true;
-            if (!bad && params_.pt_cull_depth_max > 0.0
-                     && depth > params_.pt_cull_depth_max) bad = true;
-            if (bad) {
-                landmarks_in_graph_.erase(fid);
-                lm_anchor_.erase(fid);
-                lm_last_seen_.erase(fid);
-                lm_key_.erase(fid);
-                feature_obs_.erase(fid);
-                lm_chain_reanchors_.erase(fid);
-                ++pt_cull_removed_;
-            }
-        }
-    }
 
     // ---------------------------------------------------------------
     // 7. Window bookkeeping + cleanup
@@ -1668,187 +886,23 @@ bool VioBackend::add_frame(const std::unordered_map<int64_t, Eigen::Vector2d>& o
 bool VioBackend::decide_keyframe(const std::unordered_map<int64_t, Eigen::Vector2d>& obs) {
     frames_since_kf_++;
 
-    if (last_kf_obs_.empty())                 { kf_first_++;    return true; }
-    if (frames_since_kf_ >= kf_max_interval_) { kf_interval_++; return true; }
+    if (last_kf_obs_.empty())                         return true;   // first
+    if (frames_since_kf_ >= params_.kf_max_interval) return true;   // bounds pim_
 
-    // ---- DSO three-term flow score (FullSystem::needNewKf) ----
-    // The IMU-predicted rotation splits each feature's optical flow into
-    //   flow_T  = ||p_cur - p_pred||   translation-induced (rotation warped out)
-    //   flow_R  = ||p_pred - p_ref||   rotation-induced
-    //   flow_RT = ||p_cur - p_ref||    the full displacement (what we used to threshold)
-    // and the gate fires when w_t*flow_T + w_r*flow_R + w_rt*flow_RT >= kf_parallax_px_.
-    //
-    // Keyframes serve TWO purposes and the three terms separate them. Only translation
-    // buys triangulation baseline, so DSO gives rotation-only flow weight exactly zero
-    // (setting_maxShiftWeightR = 0.0f). But rotation still sweeps features out of view and
-    // destroys co-visibility between the window and the current frame, so DSO keeps the
-    // COMBINED term at half the translation weight (maxShiftWeightT/RT = 0.04/0.02) rather
-    // than ignoring rotation outright. Measured here: dropping the combined term (w=1,0,0)
-    // is worse on ATE and NEES at every threshold including matched keyframe rate --
-    // exactly the co-visibility failure the RT term exists to prevent.
-    //
-    // pim_ integrates from the LAST KEYFRAME (reset per keyframe at the end of add_frame)
-    // and last_kf_obs_ is that same keyframe's observations, so the preintegrated rotation
-    // is exactly the delta between the two views. The rotation warp is exact only for
-    // points at infinity -- the standard approximation, and the one VINS-Mono's disabled
-    // compensatedParallax2 path uses too.
-    const bool use_rot = (kf_w_t_ != 0.0 || kf_w_r_ != 0.0) && pim_ && pim_->deltaTij() > 0.0;
-    gtsam::Rot3 cRc_inv;                      // rotates a last-KF bearing into the current cam
-    if (use_rot) {
-        const gtsam::Rot3& bRc = body_P_cam_.rotation();
-        cRc_inv = (bRc.inverse() * pim_->deltaRij() * bRc).inverse();
-    }
-
+    // Mean raw pixel displacement of the features shared with the last keyframe. (A DSO-style
+    // split into rotation and translation flow was measured and removed: dropping the combined
+    // term is worse on ATE and NEES at every threshold, KF_FEJ_smoother.)
     int n_common = 0;
-    double sum_t = 0.0, sum_r = 0.0, sum_rt = 0.0;
+    double sum = 0.0;
     for (const auto& kv : obs) {
         auto it = last_kf_obs_.find(kv.first);
         if (it == last_kf_obs_.end()) continue;
-        const gtsam::Point2 p_ref(it->second(0), it->second(1));
-        const gtsam::Point2 p_cur(kv.second(0), kv.second(1));
-        const double raw = (p_cur - p_ref).norm();
-        sum_rt += raw;
-
-        double f_t = raw, f_r = 0.0;   // no compensation -> all flow counts as translation
-        if (use_rot) {
-            const gtsam::Point2 xy = calib_->calibrate(p_ref);
-            const gtsam::Point3 b = cRc_inv.rotate(gtsam::Point3(xy.x(), xy.y(), 1.0));
-            if (b.z() > 1e-6) {        // rotated behind the camera -> leave the raw split
-                const gtsam::Point2 p_pred =
-                    calib_->uncalibrate(gtsam::Point2(b.x() / b.z(), b.y() / b.z()));
-                f_t = (p_cur - p_pred).norm();
-                f_r = (p_pred - p_ref).norm();
-            }
-        }
-        sum_t += f_t;
-        sum_r += f_r;
+        sum += (gtsam::Point2(kv.second(0), kv.second(1)) - gtsam::Point2(it->second(0), it->second(1))).norm();
         ++n_common;
     }
-
-    if (n_common > 0) {   // diagnostics: how the flow splits translation / rotation
-        kf_par_raw_sum_  += sum_rt / n_common;
-        kf_par_comp_sum_ += sum_t  / n_common;
-        kf_par_rot_sum_  += sum_r  / n_common;
-        ++kf_par_n_;
-    }
-
-    if (n_common < kf_min_tracked_) { kf_lowtrack_++; return true; }   // view changed fast
-    const double score = (kf_w_t_  * sum_t + kf_w_r_ * sum_r + kf_w_rt_ * sum_rt)
-                       / (double)n_common;
-    if (score >= kf_parallax_px_) { kf_parallax_n_++; return true; }
-    return false;
+    if (n_common < params_.kf_min_tracked) return true;                // view changed fast
+    return sum / (double)n_common >= params_.kf_parallax_px;
 }
-
-void VioBackend::print_kf_stats() const {
-    long tot = kf_first_ + kf_interval_ + kf_lowtrack_ + kf_parallax_n_;
-    std::cout << "[KF stats] total=" << tot
-              << "  first=" << kf_first_
-              << "  interval(>=" << kf_max_interval_ << "f)=" << kf_interval_
-              << "  lowtrack(<" << kf_min_tracked_ << ")=" << kf_lowtrack_
-              << "  parallax(>=" << kf_parallax_px_ << "px)=" << kf_parallax_n_ << "\n";
-
-    // Mean per-decision flow, split three ways. With the rotation warp OFF (w_t = w_r = 0)
-    // flow_T degenerates to flow_RT and flow_R is 0 by construction; with it ON,
-    // flow_R / flow_RT is the fraction of our measured "parallax" that was rotation
-    // carrying no triangulation baseline.
-    if (kf_par_n_ > 0) {
-        const double f_rt = kf_par_raw_sum_  / (double)kf_par_n_;
-        const double f_t  = kf_par_comp_sum_ / (double)kf_par_n_;
-        const double f_r  = kf_par_rot_sum_  / (double)kf_par_n_;
-        std::cout << "[KF flow] mean T=" << f_t << "px  R=" << f_r << "px  RT=" << f_rt
-                  << "px  rotation share=" << (f_rt > 1e-9 ? 100.0 * f_r / f_rt : 0.0)
-                  << "%  score=" << (kf_w_t_ * f_t + kf_w_r_ * f_r + kf_w_rt_ * f_rt)
-                  << "px  w(T,R,RT)=(" << kf_w_t_ << "," << kf_w_r_ << "," << kf_w_rt_ << ")\n";
-    }
-
-    // IMU preintegration-length loss. If the bias-correction displacement is sub-mm and
-    // the factor's claimed pos-sigma is small at our deltaTij, collapsing the
-    // between-keyframe IMU into one long CombinedImuFactor is NOT lossy at this rate.
-    if (!imu_dt_.empty()) {
-        auto q = [](std::vector<double> v, double f) {
-            std::sort(v.begin(), v.end());
-            return v[std::min(v.size() - 1, (size_t)(f * v.size()))];
-        };
-        std::cout << "[IMU preint] N=" << imu_dt_.size()
-                  << "  dt[s] med=" << q(imu_dt_, 0.5) << " p90=" << q(imu_dt_, 0.9)
-                  << " max=" << q(imu_dt_, 0.999)
-                  << "  |  bias-corr pos[mm] med=" << 1e3 * q(imu_bcorr_pos_, 0.5)
-                  << " p90=" << 1e3 * q(imu_bcorr_pos_, 0.9)
-                  << " max=" << 1e3 * q(imu_bcorr_pos_, 0.999)
-                  << "  rot[deg] med=" << q(imu_bcorr_rot_, 0.5)
-                  << " p90=" << q(imu_bcorr_rot_, 0.9)
-                  << "  |  cov pos-sig[m] med=" << q(imu_cov_pos_, 0.5)
-                  << " p90=" << q(imu_cov_pos_, 0.9)
-                  << "  cov rot-sig[deg] med=" << q(imu_cov_rot_, 0.5) << "\n";
-    }
-
-    // NIS consistency (GT-free). A = reprojection pre-fit (dof 2n, pose-only S -> conservative);
-    // B = IMU-prediction pose (dof 6, optimistic -- prior/posterior correlated). Both as
-    // NIS/dof (consistent estimator -> ~1) plus the within-95% chi-square gate.
-    if (!nis_a_ndof_.empty() || !nis_b_ndof_.empty()) {
-        auto q = [](std::vector<double> v, double f) {
-            if (v.empty()) return 0.0;
-            std::sort(v.begin(), v.end());
-            return v[std::min(v.size() - 1, (size_t)(f * v.size()))];
-        };
-        auto pct = [](const std::vector<double>& v) {
-            if (v.empty()) return 0.0;
-            double s = 0.0; for (double x : v) s += x; return 100.0 * s / v.size();
-        };
-        std::cout << "[NIS] reproj(A): N=" << nis_a_ndof_.size()
-                  << " med(NIS/dof)=" << q(nis_a_ndof_, 0.5)
-                  << " p90=" << q(nis_a_ndof_, 0.9)
-                  << " within95=" << pct(nis_a_gate_) << "%"
-                  << "  |  imu(B): N=" << nis_b_ndof_.size()
-                  << " med(NIS/6)=" << q(nis_b_ndof_, 0.5)
-                  << " p90=" << q(nis_b_ndof_, 0.9)
-                  << " within95=" << pct(nis_b_gate_) << "%\n";
-    }
-
-    // Post-fit reprojection: RMS[px] vs sigma_px, and R-normalized chi2/dof (~1 if
-    // sigma_px matches the data). Diagnoses whether the vision-side over-confidence is
-    // sigma_px mis-specification or visual information over-counting.
-    if (!reproj_rms_.empty()) {
-        auto q = [](std::vector<double> v, double f) {
-            if (v.empty()) return 0.0;
-            std::sort(v.begin(), v.end());
-            return v[std::min(v.size() - 1, (size_t)(f * v.size()))];
-        };
-        std::cout << "[reproj] post-fit residual: N=" << reproj_rms_.size()
-                  << "  RMS[px] med=" << q(reproj_rms_, 0.5) << " p90=" << q(reproj_rms_, 0.9)
-                  << "  chi2/dof(sigma_px=" << params_.pt_sigma_px << ") med="
-                  << q(reproj_chi2_, 0.5) << " p90=" << q(reproj_chi2_, 0.9) << "\n";
-    }
-
-    // Point-landmark bulletproofing counters (only when either mechanism is on).
-    if (params_.pt_obs_reject_px > 0.0 || params_.pt_cull_depth_min > 0.0
-        || params_.pt_cull_depth_max > 0.0) {
-        std::cout << "[pointgate] obs-rejected=" << pt_obs_rejected_
-                  << "  depth-culled=" << pt_cull_removed_
-                  << "  depth-transferred=" << pt_depth_transferred_
-                  << "  (reject_px=" << params_.pt_obs_reject_px
-                  << ", depth=[" << params_.pt_cull_depth_min
-                  << "," << params_.pt_cull_depth_max << "])\n";
-    }
-    // Landmark continuity counters (only when either switch is on, so the committed
-    // system's output is unchanged).
-    if (reanchor_exact_ || params_.lm_init_current_obs) {
-        std::cout << "[continuity] init-current-obs added=" << lm_init_obs_added_
-                  << " rejected=" << lm_init_obs_rejected_
-                  << "  reanchored=" << lm_reanchored_
-                  << " declined=" << lm_reanchor_declined_;
-        if (params_.lm_reanchor_max > 0)
-            std::cout << " capped=" << lm_reanchor_capped_ << " (reanchor_max " << params_.lm_reanchor_max << ")";
-        if (params_.lm_reanchor_live_max > 0)
-            std::cout << " full=" << lm_reanchor_full_ << " (reanchor_live_max " << params_.lm_reanchor_live_max << ")";
-        if (reanchor_exact_ && lm_live_n_ > 0)
-            std::cout << " live_mean=" << static_cast<double>(lm_live_sum_) / lm_live_n_
-                      << " live_peak=" << lm_live_peak_;
-        if (params_.lm_reanchor_retire) std::cout << " retire=on";
-        std::cout << "\n";
-    }
-}
-
 
 Eigen::Matrix4d VioBackend::get_current_pose() {
     gtsam::Pose3 p = latest_estimate_.at<gtsam::Pose3>(X(state_idx_));
@@ -1858,7 +912,7 @@ Eigen::Matrix4d VioBackend::get_current_pose() {
     return T;
 }
 
-// voxl-gtsam-vio patch 0001 (read-only). See the declaration.
+// Read-only, see the declaration.
 VioBackend::NavOut VioBackend::get_nav_out() const {
     NavOut o;
     if (!latest_estimate_.exists(X(state_idx_)) || !latest_estimate_.exists(V(state_idx_)))

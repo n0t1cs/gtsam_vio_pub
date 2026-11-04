@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # build.sh: build voxl-gtsam-vio.
-#   ./build.sh native              desktop: engine + gvio-engine-replay, plus the MPA server and gvio-replay
-#                                  when libmodal-pipe is found in MPA_ROOT (default ~/voxl_x86/root, made by
-#                                  scripts/build_mpa_x86.sh)
+#   ./build.sh native              engine + gvio-engine-replay + gvio-publish-check, plus the MPA server
+#                                  where libmodal-pipe is installed (the VOXL2) or found in MPA_ROOT
 #   ./build.sh qrb5165|qrb5165-2   VOXL2, inside voxl-cross: scripts/build_voxl2.sh (UNTESTED)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "${1:-}" in
   native)
-    MPA_ROOT="${MPA_ROOT:-$HOME/voxl_x86/root}"
     mkdir -p "$HERE/build" && cd "$HERE/build"
-    cmake -DMPA_ROOT="$MPA_ROOT" ..
+    cmake ${MPA_ROOT:+-DMPA_ROOT="$MPA_ROOT"} ..
     make -j"$(nproc)"
     ;;
   qrb5165|qrb5165-2)

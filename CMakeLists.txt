@@ -1,22 +1,21 @@
 # =============================================================================
 # voxl-gtsam-vio: the online GTSAM VIO on ModalAI MPA pipes.
 #
-#   gvio_core              vendored estimator (estimator/) + transport-free online engine (src/engine)
+#   gvio_core              the estimator (estimator/) + transport-free online engine (src/engine)
 #   gvio-engine-replay     the engine on a recording, in process (desktop test bench, no MPA)
+#   gvio-publish-check     the published frame convention over a run's frames.csv (no MPA)
 #   voxl-gtsam-vio-server  the service: imu_apps + a tracking camera in, vio pipes out (needs MPA)
-#   gvio-replay            a VOXL log or a dataset published as MPA pipes (needs MPA)
 #
-# Compile flags reproduce the offline estimator's build: -std=c++17 -O1 -g, GTSAM's bundled Eigen
-# first, no GTSAM compile definitions. Same flags, same compiler and same GTSAM give the same
-# floating point, which the parity test relies on. -O1 is also a known-good level: an -O2 build
-# once produced a binary that segfaulted at init/vins_realign.cpp:53 (unresolved).
+# Compile flags are those of the offline estimator's build: -std=c++17 -O1 -g, GTSAM's bundled Eigen
+# first, no GTSAM compile definitions. -O1 is a known-good level: an -O2 build once produced a binary
+# that segfaulted at init/vins_realign.cpp:53 (unresolved).
 # =============================================================================
 cmake_minimum_required(VERSION 3.10)
 project(voxl-gtsam-vio C CXX)
 
 set(GTSAM_PREFIX "/usr/local" CACHE PATH "GTSAM 4.2a9 install prefix")
 set(MPA_ROOT "" CACHE PATH "root holding usr/include + usr/lib of libmodal_pipe and libmodal_json (empty: the system, as on VOXL)")
-option(GVIO_WITH_MPA "build the MPA server and the pipe replay (needs libmodal_pipe)" ON)
+option(GVIO_WITH_MPA "build the MPA server (needs libmodal_pipe)" ON)
 option(GVIO_WITH_TBB "GTSAM was built with TBB: pin it to one thread in deterministic mode" ON)
 set(GVIO_OPT "-O1 -g" CACHE STRING "optimisation flags (-O1 -g = the validated offline build)")
 
@@ -93,7 +92,7 @@ add_executable(gvio-publish-check tools/gvio_publish_check.cpp)
 target_link_libraries(gvio-publish-check gvio_core)
 install(TARGETS gvio-engine-replay RUNTIME DESTINATION bin)
 
-# ---- MPA: the server and the pipe replay
+# ---- MPA: the server
 if(GVIO_WITH_MPA)
   set(_mpa_hint "")
   if(MPA_ROOT)
@@ -108,18 +107,15 @@ if(GVIO_WITH_MPA)
     add_executable(voxl-gtsam-vio-server ${SERVER_SRC})
     target_include_directories(voxl-gtsam-vio-server PRIVATE src/server ${MPA_INC})
     target_link_libraries(voxl-gtsam-vio-server gvio_core ${MPA_PIPE_LIB} ${MPA_JSON_LIB})
-    add_executable(gvio-replay tools/gvio_replay.cpp)
-    target_include_directories(gvio-replay PRIVATE ${MPA_INC})
-    target_link_libraries(gvio-replay gvio_core ${MPA_PIPE_LIB} ${MPA_JSON_LIB})
     if(_mpa_hint)
-      set_target_properties(voxl-gtsam-vio-server gvio-replay PROPERTIES BUILD_RPATH "${GTSAM_PREFIX}/lib;${_mpa_hint}/lib")
+      set_target_properties(voxl-gtsam-vio-server PROPERTIES BUILD_RPATH "${GTSAM_PREFIX}/lib;${_mpa_hint}/lib")
     endif()
-    install(TARGETS voxl-gtsam-vio-server gvio-replay RUNTIME DESTINATION bin)
+    install(TARGETS voxl-gtsam-vio-server RUNTIME DESTINATION bin)
     install(FILES config/voxl-gtsam-vio-server.yaml DESTINATION /etc/modalai)
     install(FILES config/estimator_mantis2.yaml DESTINATION share/voxl-gtsam-vio)
     install(FILES service/voxl-gtsam-vio-server.service DESTINATION /etc/systemd/system)
   else()
     message(WARNING "libmodal_pipe/libmodal_json not found (MPA_ROOT='${MPA_ROOT}'): building the engine and "
-                    "gvio-engine-replay only. On a desktop run scripts/build_mpa_x86.sh first.")
+                    "gvio-engine-replay only. The server builds on the VOXL2.")
   endif()
 endif()

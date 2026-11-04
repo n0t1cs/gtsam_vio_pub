@@ -30,12 +30,12 @@ ServerConfig ServerConfig::load(const std::string& path) {
     rd(r, "undistort_balance", c.undistort_balance);
     rd(r, "pinhole_override", c.pinhole_override);
     rd(r, "camera_time_offset_ns", c.camera_time_offset_ns);
-    rd(r, "sensor_yaml", c.sensor_yaml);
-    const YAML::Node lp = r["imu_lowpass"];
-    rd(lp, "enable", c.imu_lowpass);
-    rd(lp, "order", c.imu_lowpass_order);
-    rd(lp, "cutoff_hz", c.imu_lowpass_cutoff_hz);
-    rd(lp, "rate_hz", c.imu_rate_hz);
+    // Removed: the IMU low-pass (the raw IMU since V11) and the sensor_yaml test mode. A config
+    // that still enables either would run as something else, so it is refused.
+    bool lpf = false;
+    rd(r["imu_lowpass"], "enable", lpf);
+    if (lpf) throw std::runtime_error("imu_lowpass was removed (the server uses the raw IMU): delete the block");
+    if (r["sensor_yaml"]) throw std::runtime_error("sensor_yaml (the dataset test mode) was removed");
     rd(r, "output_pipe", c.output_pipe);
     rd(r, "output_pipe_extended", c.output_pipe_extended);
     rd(r, "soft_reset_keeps_frame", c.soft_reset_keeps_frame);
@@ -67,8 +67,7 @@ std::string ServerConfig::summary() const {
       << " in " << imu_frame << ")\n"
       << "intrinsics " << intrinsics_file << ", extrinsics " << extrinsics_file
       << ", balance " << undistort_balance << (pinhole_override.empty() ? "" : ", pinhole PINNED") << "\n"
-      << "imu_lowpass " << (imu_lowpass ? "on" : "off") << " order " << imu_lowpass_order << " cutoff "
-      << imu_lowpass_cutoff_hz << " Hz, camera_time_offset_ns " << camera_time_offset_ns << "\n"
+      << "raw IMU, camera_time_offset_ns " << camera_time_offset_ns << "\n"
       << "output " << output_pipe << " + " << output_pipe_extended << ", auto_reset "
       << (auto_reset ? "on" : "off") << ", log_dir '" << log_dir << "', opencv_threads " << opencv_threads
       << ", covariance " << (async_covariance ? "async" : "inline");

@@ -35,19 +35,11 @@ static double ms_since(Clock::time_point t0) {
 VioEngine::VioEngine(EngineConfig cfg)
     : cfg_(std::move(cfg)),
       log_(cfg_.log_dir),
-      imu_filter_(cfg_.imu_filter),
       img_q_(cfg_.lockstep ? 2 : std::max(1, cfg_.img_queue)),
       obs_q_(cfg_.lockstep ? 16 : std::max(1, cfg_.obs_queue)),
       fe_imu_q_(0),
       buf_(cfg_.P.init_window, cfg_.P.init_parallax_px, cfg_.P.init_min_common) {
     data_.cam_calib = cfg_.calib;
-    const VioParams& P = cfg_.P;
-    if (P.loop_closure)
-        std::cerr << "[engine] runtime.loop_closure is ignored: the online system is the no-LC odometry\n";
-    if (P.frontend_source != "images")
-        std::cerr << "[engine] frontend_source '" << P.frontend_source << "' ignored: online tracks its own images\n";
-    if (P.init_oracle_gravity)
-        std::cerr << "[engine] init.oracle_gravity ignored: it needs ground truth\n";
 
     std::ostringstream m;
     m << "pinhole K fu " << cfg_.calib.K(0, 0) << " fv " << cfg_.calib.K(1, 1) << " cu " << cfg_.calib.K(0, 2)
@@ -57,8 +49,7 @@ VioEngine::VioEngine(EngineConfig cfg)
     std::ostringstream t;
     t << "T_BC " << cfg_.calib.T_BC.row(0) << " | " << cfg_.calib.T_BC.row(1) << " | " << cfg_.calib.T_BC.row(2);
     log_.meta(t.str());
-    log_.meta(std::string("imu_filter ") + (cfg_.imu_filter.enable ? "on" : "off") + " lockstep "
-              + (cfg_.lockstep ? "on" : "off") + " auto_reset " + (cfg_.auto_reset ? "on" : "off")
+    log_.meta(std::string("lockstep ") + (cfg_.lockstep ? "on" : "off") + " auto_reset " + (cfg_.auto_reset ? "on" : "off")
               + " covariance " + (cfg_.async_covariance ? "async" : "inline"));
 }
 
@@ -77,16 +68,12 @@ void VioEngine::start() {
     fp.fb_err    = P.pt_fb_err;
     fp.ransac_th = P.pt_ransac_th;
     fp.quality   = P.pt_quality;
-    fp.grid_x    = P.pt_grid_x;
-    fp.grid_y    = P.pt_grid_y;
     fp.histeq    = (P.pt_histeq == "clahe") ? 2 : (P.pt_histeq == "equalize") ? 1 : 0;
     fp.clahe_clip = P.pt_clahe_clip;
     fp.rng_seed  = P.deterministic ? P.rng_seed : -1;
-    fp.ransac_method = (P.pt_ransac_method == "magsac") ? 1 : (P.pt_ransac_method == "twopt") ? 2 : 0;
     fp.ransac_conf   = P.pt_ransac_conf;
     fp.ransac_iters  = P.pt_ransac_iters;
-    frontend_ = std::make_unique<FrontendThread>(data_.cam_calib, fp, img_q_, obs_q_,
-                                                 P.pt_imu_aided_klt ? &fe_imu_q_ : nullptr);
+    frontend_ = std::make_unique<FrontendThread>(data_.cam_calib, fp, img_q_, obs_q_, &fe_imu_q_);
     frontend_->start();
     if (cfg_.async_covariance) {
         log_.open_cov_jobs();
@@ -97,12 +84,18 @@ void VioEngine::start() {
 }
 
 // ------------------------------------------------------------------ producers
-void VioEngine::push_imu(const ImuSample& raw) {
-    std::vector<ImuSample> out;
+void VioEngine::push_imu(const ImuSample& s) {
     bool ok;
     {
-        std::lock_guard<std::mutex> lk(imu_filter_m_);
-        ok = imu_filter_.push(raw, out);
+        std::lock_guard<std::mutex> lk(m_);
+        ok = last_imu_t_ < 0 || s.t_ns > last_imu_t_;
+        if (ok) {
+            imu_fifo_.push_back(s);
+            last_imu_t_ = s.t_ns;
+            // Without frames nothing drains the fifo. Keep the newest ~10 s: after a camera gap above
+            // max_frame_gap_s the estimator resets anyway.
+            if (imu_fifo_.size() > 20000) imu_fifo_.erase(imu_fifo_.begin(), imu_fifo_.end() - 10000);
+        }
     }
     {
         std::lock_guard<std::mutex> lk(stats_m_);
@@ -110,15 +103,6 @@ void VioEngine::push_imu(const ImuSample& raw) {
         if (!ok) ++stats_.imu_rejected;
     }
     if (!ok) { input_err_.fetch_or(err::BAD_TIMESTAMP); return; }
-    if (out.empty()) return;
-    {
-        std::lock_guard<std::mutex> lk(m_);
-        for (const auto& s : out) imu_fifo_.push_back(s);
-        last_imu_t_ = out.back().t_ns;
-        // Without frames nothing drains the fifo. Keep the newest ~10 s: after a camera gap above
-        // max_frame_gap_s the estimator resets anyway.
-        if (imu_fifo_.size() > 20000) imu_fifo_.erase(imu_fifo_.begin(), imu_fifo_.end() - 10000);
-    }
     cv_.notify_all();
 }
 
@@ -177,7 +161,7 @@ void VioEngine::sync_loop() {
             pending_.pop_front();
             // Never covered: drop it, its IMU stays queued. At the end of the input (or of the IMU)
             // no more IMU can come, so the frame goes on with what there is, as the offline driver
-            // does with the frames past a dataset's last IMU sample (the _lpf IMU ends 16.6 ms early).
+            // does with the frames past a dataset's last IMU sample.
             if (last_imu_t_ < f.t_ns && !input_done_ && !imu_done_) {
                 lk.unlock();
                 cv_.notify_all();
@@ -320,7 +304,7 @@ void VioEngine::run_init(double t_s, const Observation& obs, EngineOutput& out) 
                 std::cout << "init: window rejected -- SfM ill-conditioned (pre-BA reproj RMS "
                           << pre_ba_rms << " px > " << P.init_max_pre_ba_rms_px << " px); sliding.\n";
             } else {
-                AlignedInit align_try = init_align(sfm_ba, data_, P.init_est_ba);
+                AlignedInit align_try = init_align(sfm_ba, data_);
                 if (align_try.success) {
                     double vmax = 0.0;
                     for (const auto& vv : align_try.velocities)
@@ -371,24 +355,16 @@ void VioEngine::start_backend(AlignedInit& aligned) {
     // The init-window block of the trajectory, exactly as main.cpp writes it: the backend's poses
     // right after initialize_window, and their covariance when runtime.dump_covariance (async:
     // one job, so one factorization for the whole window).
-    cov_async_ = cfg_.async_covariance && backend_->can_snapshot();
-    const bool iw_in_smoother = P.init_continuous_window;
+    cov_async_ = cfg_.async_covariance;
     CovJob iw;
     for (size_t k = 0; k < aligned.sfm.frames.size(); ++k) {
         Eigen::Matrix4d refined;
-        const Eigen::Matrix4d T = (iw_in_smoother && backend_->get_pose_at((int)k, refined))
-                                      ? refined : aligned.T_wb[k];
+        const Eigen::Matrix4d T = backend_->get_pose_at((int)k, refined) ? refined : aligned.T_wb[k];
         log_.kf_pose(aligned.sfm.frames[k].t, T);
-        if (iw_in_smoother) {
-            if (cov_async_ && P.dump_covariance && !backend_->cheap_pose_covariance())
-                iw.poses.push_back({(int)k, aligned.sfm.frames[k].t, T});
-            else
-                push_cov((int)k, aligned.sfm.frames[k].t, T, nullptr);
-        } else if (P.dump_covariance) {
-            Eigen::Matrix<double, 6, 6> C;
-            C.setConstant(std::numeric_limits<double>::quiet_NaN());
-            log_.kf_cov(aligned.sfm.frames[k].t, T, C);
-        }
+        if (cov_async_ && P.dump_covariance && !backend_->cheap_pose_covariance())
+            iw.poses.push_back({(int)k, aligned.sfm.frames[k].t, T});
+        else
+            push_cov((int)k, aligned.sfm.frames[k].t, T, nullptr);
     }
     post_cov(std::move(iw));
     prev_t_s_ = aligned.sfm.frames.back().t;
@@ -432,18 +408,11 @@ void VioEngine::run_online(double t_s, const Observation& obs, EngineOutput& out
         const double cx = data_.cam_calib.K(0, 2), cy = data_.cam_calib.K(1, 2);
         std::unordered_map<int64_t, Eigen::Vector2d> obs_dict;
         obs_dict.reserve(obs.ids.size());
-        std::unordered_map<int64_t, double> obs_q;
-        const bool use_fb = (P.pt_hetero_metric == "fb");
-        const bool have_q = use_fb ? (obs.fb_res.size() == obs.ids.size())
-                                   : (obs.track_cnt.size() == obs.ids.size());
         for (size_t j = 0; j < obs.ids.size(); ++j) {
             double xn = obs.pts_norm(j, 0);
             double yn = obs.pts_norm(j, 1);
             obs_dict[obs.ids[j]] = Eigen::Vector2d(fx * xn + cx, fy * yn + cy);
-            if (have_q) obs_q[obs.ids[j]] = use_fb ? obs.fb_res[j]
-                                                   : static_cast<double>(obs.track_cnt[j]);
         }
-        backend_->set_obs_quality(std::move(obs_q));
 
         const auto t_bk = Clock::now();
         const bool is_kf = backend_->add_frame(obs_dict, t_s, stationary);
@@ -540,7 +509,7 @@ void VioEngine::post_cov(CovJob&& j) {
     if (j.poses.empty() && j.rels.empty()) return;
     j.session = session_;
     j.t_ns = frame_t_ns_;
-    backend_->covariance_snapshot(j.snap);         // cov_async_ implies can_snapshot
+    backend_->covariance_snapshot(j.snap);
     j.posted = Clock::now();
     bool dropped = false;
     {
@@ -696,16 +665,8 @@ void VioEngine::stop() {
 }
 
 VioEngine::Stats VioEngine::stats() const {
-    Stats s;
-    {
-        std::lock_guard<std::mutex> lk(stats_m_);
-        s = stats_;
-    }
-    std::lock_guard<std::mutex> lk(imu_filter_m_);
-    s.imu_rate_hz = imu_filter_.rate_hz();
-    s.imu_tau_ms = 1e3 * imu_filter_.tau_s();
-    s.imu_gaps = imu_filter_.n_gaps();
-    return s;
+    std::lock_guard<std::mutex> lk(stats_m_);
+    return stats_;
 }
 
 } // namespace gvio

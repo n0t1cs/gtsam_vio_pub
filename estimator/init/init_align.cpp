@@ -136,14 +136,11 @@ static void refine_gravity(const SfmResult& sfm,
                            double s,
                            const Eigen::Vector3d& g_w_init,
                            const std::vector<Eigen::Vector3d>& vel_init,
-                           bool est_ba,
                            Eigen::Vector3d& g_w_out,
-                           std::vector<Eigen::Vector3d>& velocities_out,
-                           Eigen::Vector3d& b_a_out) {
+                           std::vector<Eigen::Vector3d>& velocities_out) {
     int N = (int)sfm.frames.size();
     Eigen::Vector3d g_hat = g_w_init / g_w_init.norm();
     velocities_out = vel_init;
-    b_a_out.setZero();
 
     for (int iter = 0; iter < 4; ++iter) {
         // Orthonormal tangent basis
@@ -154,7 +151,7 @@ static void refine_gravity(const SfmResult& sfm,
         b1.normalize();
         Eigen::Vector3d b2 = g_hat.cross(b1);
 
-        int dim = 3 * N + 2 + (est_ba ? 3 : 0);   // + accel-bias (3) when co-estimating
+        int dim = 3 * N + 2;
         Eigen::MatrixXd A((N - 1) * 6, dim);
         Eigen::VectorXd B_v((N - 1) * 6);
         A.setZero();
@@ -179,8 +176,6 @@ static void refine_gravity(const SfmResult& sfm,
             A.block<3, 1>(row, 3 * N) = -G_MAG * dt * b1;
             A.block<3, 1>(row, 3 * N + 1) = -G_MAG * dt * b2;
             B_v.segment<3>(row) = g_hat * G_MAG * dt + R_wi * pre.dV;
-            // accel bias enters via dV = dV(0) + J_a_V * b_a  (first-order)
-            if (est_ba) A.block<3, 3>(row, 3 * N + 2) = -R_wi * pre.J_a_V;
 
             // Position equation
             A.block<3, 3>(row + 3, 3 * i) = Eigen::Matrix3d::Identity() * dt;
@@ -190,13 +185,10 @@ static void refine_gravity(const SfmResult& sfm,
                                        - s * (p_cj - p_ci)
                                        - R_wi * pre.dP
                                        + (R_wi - R_wj) * t_bc;
-            // accel bias enters via dP = dP(0) + J_a_P * b_a  (first-order)
-            if (est_ba) A.block<3, 3>(row + 3, 3 * N + 2) = R_wi * pre.J_a_P;
         }
 
         Eigen::VectorXd x_ref = (A.transpose() * A).ldlt().solve(A.transpose() * B_v);
 
-        if (est_ba) b_a_out = x_ref.segment<3>(3 * N + 2);
         Eigen::Vector2d dw = x_ref.segment<2>(3 * N);
         g_hat = g_hat + b1 * dw(0) + b2 * dw(1);
         g_hat.normalize();
@@ -212,8 +204,7 @@ static void refine_gravity(const SfmResult& sfm,
 // ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
-AlignedInit init_align(const SfmResult& sfm, const EurocData& data,
-                       bool est_accel_bias) {
+AlignedInit init_align(const SfmResult& sfm, const EurocData& data) {
     AlignedInit out;
     out.sfm = sfm;
 
@@ -250,35 +241,17 @@ AlignedInit init_align(const SfmResult& sfm, const EurocData& data,
     }
 
     // Stage 3
-    Eigen::Vector3d g_w, b_a;
+    Eigen::Vector3d g_w;
     std::vector<Eigen::Vector3d> velocities;
-    refine_gravity(sfm, data, b_g, R_bc, t_bc, s, g_w_init, vel_init,
-                   est_accel_bias, g_w, velocities, b_a);
-    // Sanity: a degenerate window can produce an implausible accel bias; EuRoC
-    // accel bias is ~0.01-0.1 m/s^2, so discard anything beyond a few tenths and
-    // fall back to zero rather than poison gravity/bias with a solver artefact.
-    if (est_accel_bias && b_a.norm() > 0.5) {
-        // Ill-conditioned (low excitation): the accel-bias/gravity split is
-        // unobservable, so the augmented solve corrupts gravity. Discard b_a and
-        // RE-RUN the plain refinement so gravity falls back to the safe estimate.
-        std::cout << "init_align: est accel bias |b_a|=" << b_a.norm()
-                  << " m/s^2 implausible (unobservable) -> fallback to plain gravity refine\n";
-        b_a.setZero();
-        refine_gravity(sfm, data, b_g, R_bc, t_bc, s, g_w_init, vel_init,
-                       false, g_w, velocities, b_a);
-    }
+    refine_gravity(sfm, data, b_g, R_bc, t_bc, s, g_w_init, vel_init, g_w, velocities);
     std::cout << "init_align: refined gravity  g_w=["
               << g_w(0) << "," << g_w(1) << "," << g_w(2) << "]"
-              << "  |g|=" << g_w.norm();
-    if (est_accel_bias)
-        std::cout << "  b_a=[" << b_a(0) << "," << b_a(1) << "," << b_a(2) << "]";
-    std::cout << "\n";
+              << "  |g|=" << g_w.norm() << "\n";
 
     out.success = true;
     out.scale = s;
     out.g_w = g_w;
     out.b_g = b_g;
-    out.b_a = b_a;
     out.velocities = std::move(velocities);
     return out;
 }

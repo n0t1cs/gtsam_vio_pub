@@ -1,8 +1,7 @@
 #pragma once
-// Three per-frame helpers of the offline driver (cpp_gtsam_vio/main.cpp), copied VERBATIM so the
-// online engine feeds the estimator exactly as the measured system does. main.cpp keeps them as
-// file-static functions, so they cannot be linked from there. If main.cpp changes them, change
-// these copies too (scripts/check_helpers.sh compares the bodies).
+// Three per-frame helpers of the offline driver (cpp_gtsam_vio/main.cpp), first copied verbatim so
+// the online engine fed the estimator exactly as the measured system did. These copies are now the
+// source (the offline system is frozen).
 #include "vio_backend.h"
 #include "vio_types.h"
 

@@ -8,7 +8,6 @@
 // output_pipe_extended (ext_vio_data_t). See README.md.
 #include "camera_model.h"
 #include "engine.h"
-#include "load.h"
 #include "mpa_bridge.h"
 #include "params.h"
 #include "server_config.h"
@@ -50,32 +49,17 @@ int main(int argc, char** argv) {
         std::cout << "[config] " << config << "\n" << sc.summary() << "\n";
         ec.P = vio::VioParams::load(sc.estimator_config);
 
-        if (!sc.sensor_yaml.empty()) {
-            // Test mode: the frames are a dataset's pinhole images, the dataset's camera is the camera.
-            const vio::CamCalib c = vio::load_cam_calib(sc.sensor_yaml);
-            ec.undistort.init_passthrough(c.K, c.width, c.height);
-            ec.calib = c;
-            if (ec.P.ext_T_BC.size() == 16)
-                ec.calib.T_BC = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::RowMajor>>(ec.P.ext_T_BC.data());
-            ic.model = "pinhole";
-            std::cout << "[camera] TEST MODE: " << sc.sensor_yaml << " (pinhole frames, no remap)\n";
-        } else {
         ic = gvio::load_opencv_intrinsics(sc.intrinsics_file);
         Eigen::Vector4d pin;
         if (sc.pinhole_override.size() == 4)
             pin << sc.pinhole_override[0], sc.pinhole_override[1], sc.pinhole_override[2], sc.pinhole_override[3];
-        Eigen::Matrix4d T_BC = gvio::load_voxl_extrinsic(sc.extrinsics_file, sc.imu_frame, sc.camera_name);
-        if (ec.P.ext_T_BC.size() == 16) {
-            T_BC = Eigen::Map<const Eigen::Matrix<double, 4, 4, Eigen::RowMajor>>(ec.P.ext_T_BC.data());
-            std::cout << "[extrinsics] T_BC OVERRIDDEN by the estimator config's extrinsics block\n";
-        }
+        const Eigen::Matrix4d T_BC = gvio::load_voxl_extrinsic(sc.extrinsics_file, sc.imu_frame, sc.camera_name);
         ec.calib = gvio::setup_voxl_camera(ic, sc.undistort_balance, sc.pinhole_override.empty() ? nullptr : &pin,
                                            T_BC, ec.undistort);
         std::cout << "[camera] " << sc.camera_name << " " << ic.model << " " << ic.width << "x" << ic.height
                   << " -> pinhole fu " << ec.calib.K(0, 0) << " fv " << ec.calib.K(1, 1) << " cu "
                   << ec.calib.K(0, 2) << " cv " << ec.calib.K(1, 2) << "\n[camera] T_BC (camera in "
                   << sc.imu_frame << ")\n" << T_BC << "\n";
-        }
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << "\n";
         return 1;
@@ -83,10 +67,6 @@ int main(int argc, char** argv) {
     if (sc.opencv_threads >= 0) cv::setNumThreads(sc.opencv_threads);
     std::cout << "[opencv] " << cv::getNumThreads() << " worker threads ("
               << (sc.opencv_threads >= 0 ? "opencv_threads" : "OpenCV's default") << ")\n";
-    ec.imu_filter.enable = sc.imu_lowpass;
-    ec.imu_filter.order = sc.imu_lowpass_order;
-    ec.imu_filter.cutoff_hz = sc.imu_lowpass_cutoff_hz;
-    ec.imu_filter.rate_hz = sc.imu_rate_hz;
     ec.max_pending_frames = sc.max_pending_frames;
     ec.imu_wait_timeout_s = sc.imu_wait_timeout_s;
     ec.async_covariance = sc.async_covariance;

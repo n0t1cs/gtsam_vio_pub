@@ -1,5 +1,5 @@
-// VERBATIM copies of cpp_gtsam_vio/main.cpp (integrate_imu_batch, check_imu_excitation,
-// detect_stationary). Only the namespace qualifiers differ. See offline_helpers.h.
+// First copied verbatim from the offline driver cpp_gtsam_vio/main.cpp (integrate_imu_batch,
+// check_imu_excitation, detect_stationary), only the namespace qualifiers differ. See offline_helpers.h.
 #include "offline_helpers.h"
 
 #include <algorithm>

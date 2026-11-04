@@ -109,7 +109,7 @@ gtsam::Vector3 reanchor_invdepth(const gtsam::Vector3& l, const gtsam::Pose3& wT
 // The map L_a <-> L_b is invertible for fixed poses, so with a tight sigma eliminating
 // L_a moves all of its information into L_b, including the part already folded into a
 // marginal, and leaves the information on the poses unchanged.
-// No measurement is re-emitted, unlike the depth transfer (point_depth_transfer), which
+// No measurement is re-emitted, unlike a VINS-Mono-style depth transfer, which
 // re-attaches views that are already inside the marginal. A finite sigma only adds noise,
 // so the approximation errs on the conservative side.
 class InvDepthReanchorFactor

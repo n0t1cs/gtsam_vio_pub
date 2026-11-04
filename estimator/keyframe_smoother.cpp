@@ -1,6 +1,5 @@
 #include "keyframe_smoother.h"
 
-#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/GaussNewtonOptimizer.h>
 #include <gtsam/nonlinear/Marginals.h>
 #include <gtsam/nonlinear/LinearContainerFactor.h>
@@ -10,11 +9,7 @@
 #include <gtsam/inference/Ordering.h>
 #include <gtsam/inference/Symbol.h>
 
-#include <Eigen/SVD>
-#include <Eigen/QR>
-
 #include <algorithm>
-#include <limits>
 #include <set>
 #include <vector>
 
@@ -49,13 +44,9 @@ KeyframeSmoother::Result KeyframeSmoother::update(
     }
     const std::uint64_t currentKf = currentKf_;
 
-    // 5. optimize the (bounded) window, warm-started from theta_. The optimizer is the
-    //    companion of the filter<->smoother knob: LM (default) damps each step; Gauss-Newton
-    //    takes the full undamped step, so a SINGLE GN iteration IS one EKF update (making the
-    //    "SLKS is a filter in disguise" claim exact). GN has no damping to rescue an
-    //    ill-conditioned window, so it is the robustness side of the GN-vs-LM study; iSAM2
-    //    (the incremental arm) is likewise GN-based, so this also isolates the LM/GN axis
-    //    between our two proven back-ends.
+    // 5. optimize the (bounded) window, warm-started from theta_. Gauss-Newton takes the full
+    //    undamped step, so a SINGLE GN iteration IS one EKF update (making the "SLKS is a
+    //    filter in disguise" claim exact). iSAM2 (the incremental arm) is likewise GN-based.
     // ...under a SOLVE-GUARD (step 6 folded in). An underconstrained landmark (too few
     //    effective views, degenerate geometry) can make the window's linear system
     //    indeterminate; GTSAM then throws IndeterminantLinearSystemException and, uncaught,
@@ -73,21 +64,12 @@ KeyframeSmoother::Result KeyframeSmoother::update(
     const int kMaxGuard = 8;
     for (int attempt = 0; ; ++attempt) {
         try {
-            // 5. optimize the (bounded) window, warm-started from theta_. LM (default)
-            //    damps each step; a single Gauss-Newton iteration IS one EKF update.
-            if (useGn_) {
-                gtsam::GaussNewtonParams p;
-                p.setMaxIterations(maxIter_);
-                gtsam::GaussNewtonOptimizer opt(graph_, theta_, p);
-                theta_ = opt.optimize();
-                iters = opt.iterations();
-            } else {
-                gtsam::LevenbergMarquardtParams p;
-                p.setMaxIterations(maxIter_);   // 1 = single linearization/step (EKF-like); 10 = smoother
-                gtsam::LevenbergMarquardtOptimizer opt(graph_, theta_, p);
-                theta_ = opt.optimize();
-                iters = opt.iterations();
-            }
+            // 5. optimize the (bounded) window, warm-started from theta_.
+            gtsam::GaussNewtonParams p;
+            p.setMaxIterations(maxIter_);
+            gtsam::GaussNewtonOptimizer opt(graph_, theta_, p);
+            theta_ = opt.optimize();
+            iters = opt.iterations();
 
             // 6. bound the window to the newest `window_` keyframes. Poses older than the
             //    cutoff, and landmarks not observed since the cutoff, are marginalized out.
@@ -104,7 +86,6 @@ KeyframeSmoother::Result KeyframeSmoother::update(
     Result r;
     r.iterations = iters;
     r.nonlinearVariables = theta_.size();
-    r.error = graph_.error(theta_);
     return r;
 }
 
@@ -187,147 +168,12 @@ void KeyframeSmoother::marginalizeOlderThan(std::uint64_t cutoff) {
     // ---- Schur complement: eliminate the evicted keys and wrap the resulting marginal
     //      on the separator in LinearContainerFactors. This preserves the evicted
     //      information instead of discarding it (dropping it outright starves the
-    //      window and diverges). ----
-    //      The eliminate function is selectable (runtime.kf_marg_elim). GTSAM's default for a
-    //      GaussianFactorGraph is EliminatePreferCholesky: it forms the normal equations,
-    //      so the marginal is computed at cond(J)^2 (it does fall back to QR when the
-    //      Cholesky attempt fails). EliminateQR stays in square-root form throughout,
-    //      working on the Jacobian at cond(J). In double precision the two are
-    //      algebraically equivalent — measuring that equivalence is the point.
-    const auto elimFn = useQrMarg_ ? static_cast<gtsam::GaussianFactorGraph::Eliminate>(gtsam::EliminateQR)
-                                   : static_cast<gtsam::GaussianFactorGraph::Eliminate>(gtsam::EliminatePreferCholesky);
-    const auto elim = linear.eliminatePartialMultifrontal(gtsam::Ordering(margKeys), elimFn);
+    //      window and diverges). GTSAM's EliminatePreferCholesky (EliminateQR gives
+    //      the identical estimate at twice the cost). ----
+    const auto elim = linear.eliminatePartialMultifrontal(
+        gtsam::Ordering(margKeys),
+        static_cast<gtsam::GaussianFactorGraph::Eliminate>(gtsam::EliminatePreferCholesky));
 
-    // ---- Conditioning diagnostic (opt-in, runtime.kf_diag_cond). Measure the
-    //      conditioning of the system this Schur step eliminates. cond(J) is the number
-    //      the square-root argument turns on: a Cholesky elimination forms J^T J and so
-    //      operates at cond(J)^2, and single precision (eps^-1 ~ 1.2e7) fails once
-    //      cond(J)^2 approaches that. Recording cond(J) in double therefore gives the
-    //      float32 margin WITHOUT needing a float32 build.
-    //      Dense SVD per marginalization — diagnostic runs only, timing not comparable. ----
-    if (diagCond_) {
-        CondDiag d;
-        d.kf       = cutoff;
-        d.margKeys = static_cast<int>(margKeys.size());
-
-        // Assemble the dense Jacobian OURSELVES, factor by factor, instead of calling
-        // GaussianFactorGraph::jacobian(). That convenience path goes through Scatter and
-        // trips an Eigen assertion (which abort()s — it cannot be caught) on the graphs
-        // produced here after a solve-guard cull. Building the block layout directly from
-        // each factor's own keys and dimensions is equivalent and fully under our control.
-        auto denseJacobian = [](const gtsam::GaussianFactorGraph& g) -> gtsam::Matrix {
-            std::map<gtsam::Key, std::size_t> dim, off;
-            std::vector<std::pair<gtsam::Matrix, gtsam::Vector>> blocks;
-            blocks.reserve(g.size());
-            std::size_t totalRows = 0;
-            for (const auto& f : g) {
-                if (!f) continue;
-                std::pair<gtsam::Matrix, gtsam::Vector> ab = f->jacobian();
-                for (auto it = f->begin(); it != f->end(); ++it)
-                    if (!dim.count(*it)) dim[*it] = f->getDim(it);
-                totalRows += static_cast<std::size_t>(ab.first.rows());
-                blocks.push_back(std::move(ab));
-            }
-            std::size_t totalCols = 0;
-            for (const auto& kv : dim) { off[kv.first] = totalCols; totalCols += kv.second; }
-            if (totalRows == 0 || totalCols == 0) return gtsam::Matrix();
-            gtsam::Matrix A = gtsam::Matrix::Zero(totalRows, totalCols);
-            std::size_t r = 0, bi = 0;
-            for (const auto& f : g) {
-                if (!f) continue;
-                const gtsam::Matrix& Af = blocks[bi].first;
-                std::size_t c = 0;
-                for (auto it = f->begin(); it != f->end(); ++it) {
-                    const std::size_t dk = dim[*it];
-                    if (c + dk <= static_cast<std::size_t>(Af.cols()))
-                        A.block(r, off[*it], Af.rows(), dk) = Af.block(0, c, Af.rows(), dk);
-                    c += dk;
-                }
-                r += static_cast<std::size_t>(Af.rows());
-                ++bi;
-            }
-            return A;
-        };
-
-        // Effective conditioning over the NUMERICALLY NON-ZERO spectrum. A raw smax/smin
-        // is meaningless here: the eliminated subgraph is rank-deficient by construction
-        // (that is exactly why the Schur step projects onto the separator), so smin is
-        // legitimately 0 and the raw ratio is inf. What governs numerical behaviour is the
-        // spread across the directions the system actually constrains, at the standard
-        // tolerance tol = max(m,n)*eps*smax.
-        // Eigen's BDCSVD has a defect in perturbCol0() that indexes out of range on
-        // rank-deficient matrices with repeated singular values — precisely the case
-        // here — and it abort()s rather than throwing. GTSAM ships that Eigen version.
-        // So: the large eliminated system is characterised with a RANK-REVEALING
-        // column-pivoted QR (robust, O(mn^2), rank + a condition ESTIMATE from the R
-        // diagonal), while the small marginal prior — the quantity the float32 argument
-        // actually turns on — gets an exact JacobiSVD.
-        auto spectrumQR = [](const gtsam::Matrix& M, int& rank, double& smax,
-                             double& sminEff, double& condEff) {
-            rank = 0; smax = sminEff = condEff = 0.0;
-            if (M.rows() == 0 || M.cols() == 0) return;
-            Eigen::ColPivHouseholderQR<gtsam::Matrix> qr(M);
-            rank = static_cast<int>(qr.rank());
-            const gtsam::Matrix R = qr.matrixR();
-            const int n = static_cast<int>(std::min(R.rows(), R.cols()));
-            if (n == 0) return;
-            smax = std::abs(R(0, 0));
-            const int last = std::max(0, std::min(rank, n) - 1);
-            sminEff = std::abs(R(last, last));
-            condEff = (sminEff > 0.0) ? (smax / sminEff)
-                                      : std::numeric_limits<double>::infinity();
-        };
-        auto spectrumSVD = [](const gtsam::Matrix& M, int& rank, double& smax,
-                              double& sminEff, double& condEff) {
-            rank = 0; smax = sminEff = condEff = 0.0;
-            if (M.rows() == 0 || M.cols() == 0) return;
-            Eigen::JacobiSVD<gtsam::Matrix> svd(M);
-            const gtsam::Vector sv = svd.singularValues();
-            if (sv.size() == 0) return;
-            smax = sv(0);
-            const double tol = static_cast<double>(std::max(M.rows(), M.cols())) *
-                               std::numeric_limits<double>::epsilon() * smax;
-            for (int i = 0; i < sv.size(); ++i)
-                if (sv(i) > tol) { ++rank; sminEff = sv(i); }
-            condEff = (sminEff > 0.0) ? (smax / sminEff)
-                                      : std::numeric_limits<double>::infinity();
-        };
-
-        try {
-            const gtsam::Matrix A = denseJacobian(linear);
-            d.rows = static_cast<int>(A.rows());
-            d.cols = static_cast<int>(A.cols());
-            double smax = 0.0;
-            spectrumQR(A, d.rankJ, smax, d.sminEff, d.condEff);
-            d.smax = smax;
-            d.smin = (d.rankJ == d.cols) ? d.sminEff : 0.0;   // exactly 0 when rank-deficient
-            d.cond = (d.smin > 0.0) ? (smax / d.smin)
-                                    : std::numeric_limits<double>::infinity();
-
-            if (elim.second) {
-                gtsam::Matrix P = denseJacobian(*elim.second);
-                d.priorRows = static_cast<int>(P.rows());
-                d.priorCols = static_cast<int>(P.cols());
-                double psmax = 0.0;
-                spectrumSVD(P, d.priorRank, psmax, d.priorSmin, d.priorCondEff);
-                d.priorCond = d.priorCondEff;
-                // Jacobi (unit-column-norm) scaling strips the arbitrary unit scaling of a
-                // mixed VI state vector (m, rad, m/s, bias, inverse depth), leaving the
-                // geometric conditioning.
-                if (P.rows() > 0 && P.cols() > 0) {
-                    for (int c = 0; c < P.cols(); ++c) {
-                        const double n = P.col(c).norm();
-                        if (n > 0.0) P.col(c) /= n;
-                    }
-                    int r2 = 0; double s2 = 0.0, se2 = 0.0;
-                    spectrumSVD(P, r2, s2, se2, d.priorCondScaled);
-                }
-            }
-        } catch (const std::exception&) {
-            // a diagnostic must never take the estimator down; leave the record partial
-        }
-        condLog_.push_back(d);
-    }
     const gtsam::NonlinearFactorGraph marginal =
         gtsam::LinearContainerFactor::ConvertLinearGraph(*elim.second, theta_);
 

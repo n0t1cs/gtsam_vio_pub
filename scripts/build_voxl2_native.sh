@@ -101,7 +101,7 @@ cmake -DCMAKE_C_COMPILER=gcc-8 -DCMAKE_CXX_COMPILER=g++-8 -DGVIO_WITH_TBB=OFF \
       -DCMAKE_PREFIX_PATH="$S" -DOpenCV_DIR="$S/lib/cmake/opencv4" \
       -DMPA_PIPE_LIB="$MPA_PIPE" -DMPA_JSON_LIB="$MPA_JSON" ..
 make -j"$J"
-ls -l gvio-engine-replay gvio-publish-check voxl-gtsam-vio-server gvio-replay
+ls -l gvio-engine-replay gvio-publish-check voxl-gtsam-vio-server
 if ldd voxl-gtsam-vio-server | grep 'not found'; then
   echo "ERROR: voxl-gtsam-vio-server has unresolved libraries (above)" >&2; exit 1
 fi

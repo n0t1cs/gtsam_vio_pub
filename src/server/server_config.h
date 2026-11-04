@@ -21,14 +21,6 @@ struct ServerConfig {
     std::vector<double> pinhole_override;   // [fu, fv, cu, cv], empty = computed from the balance
     long long camera_time_offset_ns = 0;     // added to every frame stamp. 0 = the metadata stamp
                                              // (start of exposure), as in the offline datasets
-    std::string sensor_yaml;                 // TESTS: a EuRoC cam0/sensor.yaml replaces both calibration
-                                             // files (pinhole frames, no remap), for dataset replays
-
-    // IMU low-pass (the _lpf datasets' filter)
-    bool   imu_lowpass = true;
-    int    imu_lowpass_order = 4;
-    double imu_lowpass_cutoff_hz = 25.0;
-    double imu_rate_hz = 0.0;                // 0 = measured at start
 
     // outputs
     std::string output_pipe          = "gvio";            // vio_data_t

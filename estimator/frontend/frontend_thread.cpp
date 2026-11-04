@@ -20,9 +20,9 @@ FrontendThread::FrontendThread(const CamCalib& calib, const Params& p,
                                ThreadSafeQueue<StampedImage>& in,
                                ThreadSafeQueue<StampedObservation>& out,
                                ThreadSafeQueue<ImuSample>* imu_in)
-    : tracker_(calib, p.max_pts, p.min_dist, p.fb_err, p.ransac_th, p.quality, p.grid_x, p.grid_y, p.histeq, p.clahe_clip),
+    : tracker_(calib, p.max_pts, p.min_dist, p.fb_err, p.ransac_th, p.quality, p.histeq, p.clahe_clip),
       in_(in), out_(out), imu_in_(imu_in), rng_seed_(p.rng_seed) {
-    tracker_.set_outlier_rejection(p.ransac_method, p.ransac_conf, p.ransac_iters, p.rng_seed);
+    tracker_.set_outlier_rejection(p.ransac_conf, p.ransac_iters, p.rng_seed);
 }
 
 Eigen::Matrix3d FrontendThread::integrate_gyro(int64_t t_cur) {
@@ -73,17 +73,11 @@ void FrontendThread::run() {
         const Eigen::Matrix3d dR_body = integrate_gyro(si.t_ns);   // gyro since last frame
         StampedObservation so;
         so.t_ns = si.t_ns;
-        // Time the tracking step only: this is the per-frame cost a detection thread
-        // carries on the vehicle. Queue waits and image decode are excluded on purpose.
-        const auto _t0 = std::chrono::steady_clock::now();
         so.obs  = tracker_.step(si.img, dR_body);    // IMU-aided KLT
-        track_ms_.push_back(1e3 * std::chrono::duration<double>(
-                                      std::chrono::steady_clock::now() - _t0).count());
         so.cost = tracker_.last_cost();              // stage times, and this thread's CPU clock
         so.cost.thread_cpu_ms = thread_cpu_ms();
         out_.push(std::move(so));
         prev_t_ns_ = si.t_ns;
-        n_.fetch_add(1, std::memory_order_relaxed);
     }
     out_.close();                                    // unblock the VIO thread's drain loop
     running_.store(false);

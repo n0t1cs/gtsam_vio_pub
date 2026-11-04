@@ -63,67 +63,24 @@ public:
     struct Result {
         std::size_t iterations = 0;
         std::size_t nonlinearVariables = 0;
-        double      error = 0.0;
-    };
-
-    // Conditioning diagnostic (runtime.kf_diag_cond). One record per marginalization, only
-    // populated when setCondDiagnostics(true). Measures the conditioning of the system
-    // the Schur step actually eliminates, which is the quantity the square-root argument
-    // is about: Cholesky forms the normal equations and therefore works at cond(J)^2,
-    // while a QR/square-root elimination works at cond(J). Recording cond(J) here gives
-    // the margin to the float32 cliff without needing a float32 build.
-    // NOTE: computing singular values per marginalization is EXPENSIVE (dense SVD).
-    // Runs with this enabled are diagnostic only — their timing is NOT comparable to a
-    // normal run and must never be quoted in a Pareto claim.
-    struct CondDiag {
-        std::uint64_t kf        = 0;   // cutoff keyframe index of this marginalization
-        int    margKeys         = 0;   // variables eliminated
-        int    rows             = 0;   // rows of the eliminated system's Jacobian J
-        int    cols             = 0;   // cols of J
-        double smax             = 0.0; // largest  singular value of J
-        double smin             = 0.0; // smallest singular value of J
-        double cond             = 0.0; // smax/smin = cond(J)
-        int    rankJ            = 0;   // numerical rank of J at tol = max(m,n)*eps*smax
-        double sminEff          = 0.0; // smallest singular value ABOVE tol
-        double condEff          = 0.0; // smax/sminEff = effective cond(J) on its row space
-        int    priorRows        = 0;   // resulting marginal prior (already square-root form)
-        int    priorCols        = 0;
-        double priorSmin        = 0.0;
-        double priorCond        = 0.0; // raw smax/smin of the prior
-        int    priorRank        = 0;
-        double priorCondEff     = 0.0; // effective cond of the prior
-        double priorCondScaled  = 0.0; // effective cond AFTER unit-norm column scaling
-                                       // (Jacobi): separates genuine ill-conditioning
-                                       // from the mixed units of a VI state vector
-                                       // (m, rad, m/s, bias, inverse depth).
     };
 
     // windowSize = N_kf: keyframes kept before the oldest is evicted.
     // useFej: hold the marginalization at first-estimate Jacobians (see fejValues_).
     // fejFilter: which keys FEJ applies to; default (empty) = all of them.
-    // maxIterations: window re-optimization iterations per update(). This is the
-    //   filter<->smoother knob: 10 = a re-linearizing smoother; 1 = a single
-    //   linearization per step, i.e. an (iterated-)EKF update. Combined with a small
-    //   windowSize it degenerates this class toward a filter on the same code path.
-    // useGaussNewton: solve each window with an undamped Gauss-Newton step instead of
-    //   Levenberg-Marquardt. With maxIterations=1 this makes the update a single EKF-style
-    //   linearized correction (no LM damping). Default false = LM (unchanged behaviour).
+    // maxIterations: Gauss-Newton iterations per update(). This is the filter<->smoother
+    //   knob: 10 = a re-linearizing smoother; 1 = a single undamped linearization per step,
+    //   i.e. an EKF update. Combined with a small windowSize it degenerates this class
+    //   toward a filter on the same code path. (Levenberg-Marquardt was measured equal on
+    //   ATE and NEES and about 5 % slower, and removed.)
     // cullFilter: which keys the solve-guard may drop on an indeterminate window (see
     //   CullKeyFilter; default empty = drop nothing = pre-guard behaviour).
-    // useQrMarginalization: eliminate the evicted keys with EliminateQR (square-root form,
-    //   operates on the Jacobian at cond(J)) instead of GTSAM's default
-    //   EliminatePreferCholesky (normal equations, cond(J)^2). Default false = unchanged
-    //   behaviour. In double precision the two are algebraically equivalent; this is the
-    //   knob for study S1, which tests whether that equivalence actually holds here.
     explicit KeyframeSmoother(int windowSize, bool useFej = true,
                               FejKeyFilter fejFilter = FejKeyFilter(),
                               int maxIterations = 10,
-                              bool useGaussNewton = false,
-                              CullKeyFilter cullFilter = CullKeyFilter(),
-                              bool useQrMarginalization = false)
+                              CullKeyFilter cullFilter = CullKeyFilter())
         : window_(windowSize), useFej_(useFej), fejFilter_(std::move(fejFilter)),
-          maxIter_(maxIterations), useGn_(useGaussNewton),
-          cullFilter_(std::move(cullFilter)), useQrMarg_(useQrMarginalization) {}
+          maxIter_(maxIterations), cullFilter_(std::move(cullFilter)) {}
 
     // Add factors/values, refresh keyframe indices, optimize, then bound the window.
     // Argument order mirrors gtsam::FixedLagSmoother::update.
@@ -153,11 +110,6 @@ public:
     // Newest keyframe index the smoother has been told about.
     std::uint64_t currentKeyframe() const { return currentKf_; }
 
-    // S2: enable/read the per-marginalization conditioning log. Off by default; the
-    // committed system pays nothing for it.
-    void setCondDiagnostics(bool on) { diagCond_ = on; }
-    const std::vector<CondDiag>& condLog() const { return condLog_; }
-
 private:
     // Schur-marginalize every key whose keyframe index is older than `cutoff`.
     // The marginal on the surviving separator is appended as LinearContainerFactors,
@@ -178,12 +130,8 @@ private:
     int          window_;                 // N_kf (keyframes kept)
     bool         useFej_;                 // hold marginalization at first estimates
     FejKeyFilter fejFilter_;              // which keys FEJ covers (empty = all)
-    int          maxIter_ = 10;           // window re-opt iterations (1 = EKF-like)
-    bool         useGn_ = false;          // Gauss-Newton (undamped) instead of LM
+    int          maxIter_ = 10;           // Gauss-Newton iterations per update (1 = EKF-like)
     CullKeyFilter cullFilter_;            // keys the solve-guard may drop (empty = none)
-    bool         useQrMarg_ = false;      // marginalize via EliminateQR (square-root) vs Cholesky
-    bool         diagCond_  = false;      // S2: record conditioning at each marginalization
-    std::vector<CondDiag> condLog_;       // S2: one record per marginalization
 
     gtsam::NonlinearFactorGraph graph_;   // accumulated, bounded to the window
     gtsam::Values theta_;                 // current linearization point / estimate
