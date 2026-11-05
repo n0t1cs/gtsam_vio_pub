@@ -21,7 +21,7 @@ Given the same inputs, the online engine reproduces the offline estimate byte fo
 |---|---|
 | online engine (`src/engine`) | built and validated on an x86 desktop (Validation) |
 | published frame | checked against motion capture: no axis flip, 9.7 cm rms after aligning one pose |
-| MPA server (`src/server`) | run on a VOXL2, fed by ModalAI's `voxl-replay` from two recorded flights and the 11 EuRoC sequences: iSAM2 in real time on every run, the SLKS on every run since the covariance thread (both flights and the four sequences where it used to drop frames) (Validation) |
+| MPA server (`src/server`) | run on a VOXL2, fed by ModalAI's `voxl-replay` from two recorded flights and the 11 EuRoC sequences, both backends, six seeds each: real time on 153 of 156 runs, the other 3 lost 6 to 8 frames in the first second after initialisation (Validation) |
 | VOXL2 build on the board (`scripts/build_voxl2_native.sh`) | done on a VOXL2 (system image 1.8, voxl-suite 1.5.1). The project stage needs 1 parallel job (below) |
 | cross build and package (`scripts/build_voxl2.sh`, `make_package.sh`) | written, untested |
 | live sensors, flight | not done. Bench test first (below) |
@@ -85,10 +85,12 @@ age, a landmark when it was last seen too long ago. `runtime.backend_mode` selec
   indeterminate (landmarks only). At `kf_max_iterations: 1` it relinearises once per keyframe, a filter
   built from smoother code.
 
-At an equal window the two give the same accuracy and the same consistency on the EuRoC sequences. On
-a VOXL2 the SLKS's keyframe update takes 1.02 to 1.13 times iSAM2's, but iSAM2 reads its pose
-covariance off its Bayes tree while the SLKS factorises its window for it, so estimator plus
-covariance CPU per keyframe is 1.7 to 2.0 times iSAM2's: iSAM2 is the cheaper one. Boundary
+At an equal window the two give the same accuracy and the same consistency on the EuRoC sequences on
+a desktop. On a VOXL2 they keep the same consistency, and the SLKS's ATE is lower on 10 of 13 logs
+(median ratio 0.92), short of significance. Its keyframe update takes 1.03 to 1.09 times iSAM2's on
+average, but iSAM2 reads its pose covariance off its Bayes tree while the SLKS factorises its window
+for it, so estimator plus covariance CPU per keyframe is 1.55 to 1.95 times iSAM2's and the server
+takes 7 to 14 % more CPU: iSAM2 is the cheaper one. Boundary
 first-estimates Jacobians, declared in the SLKS and built into iSAM2, lower the pose NEES and raise the
 relative pose error per metre by 7 to 10 %.
 
@@ -236,32 +238,31 @@ motion capture, then on a VOXL2.
 - **Published frame.** `build/gvio-publish-check LOG` runs the bridge's conversion on a log. Against
   motion capture: 4.7 deg between the frames (2.7 deg of it is the motion-capture world's tilt),
   positions within 9.7 cm rms over 168 s after aligning one pose, body z down.
-- **On a VOXL2, iSAM2.** The server built on the board (gcc 8, `-O1 -g`, GTSAM without TBB, all 8
-  cores on the `performance` governor, 4 OpenCV workers), fed in real time by `voxl-replay` from the
-  two recorded flights, six seeds each, one run at a time. Every run kept up: no frame lost in flight,
-  no reset. Means over the six runs:
+- **On a VOXL2, both backends.** The server built on the board (gcc 8, `-O1 -g`, GTSAM without TBB,
+  all 8 cores on the `performance` governor, 4 OpenCV workers, this release), fed in real time by
+  `voxl-replay` from the 11 EuRoC sequences and the two recorded flights, six seeds per backend, 156
+  runs one at a time in one session. Means over the six seeds (EuRoC: mean over the 11 sequences),
+  iSAM2 / SLKS:
 
-  | | flight 1 (30 Hz camera) | flight 2 (19.5 Hz camera) |
-  |---|---|---|
-  | ATE on the VOXL2 (m) | 0.0591 | 0.0335 |
-  | ATE on the desktop, six seeds, lockstep (m) | 0.0557 | 0.0342 |
-  | latency p50 / p95 (ms) | 26.5 / 88.6 | 26.3 / 92.3 |
-  | keyframe update p50 (ms) | 52.4 | 52.6 |
-  | server CPU (cores) | 1.91 | 1.31 |
-  | server peak memory (MB) | 89 | 57 |
+  | | EuRoC (20 Hz camera) | flight 1 (30 Hz camera) | flight 2 (19.5 Hz camera) |
+  |---|---|---|---|
+  | ATE (m) | 0.146 / 0.140 | 0.056 / 0.054 | 0.037 / 0.035 |
+  | latency p50 (ms) | 21.1 / 20.9 | 26.4 / 25.2 | 26.2 / 25.8 |
+  | latency p95 (ms) | 71 / 68 | 89 / 81 | 92 / 83 |
+  | keyframe update p50 (ms) | 29.3 / 33.7 | 52.5 / 54.5 | 52.8 / 54.4 |
+  | server CPU (cores) | 1.34 / 1.47 | 1.91 / 2.09 | 1.29 / 1.40 |
+  | server peak memory (MB) | 37 / 32 | 88 / 31 | 51 / 31 |
 
-  The board's runs are not the desktop's runs of the same seed (real time, float32 IMU in the pipe,
-  ARM floating point, and the first frame the server receives), so the comparison is between the two
-  spreads. Which frame the server receives first moves the ATE by as much as the seed does. With the
-  same seed and the same first frame a run repeats byte for byte. Latency p95 is set by the keyframe
-  updates. The OpenCV worker count changes the cost, never the estimate.
-- **On a VOXL2, both backends.** The same flights and four EuRoC sequences, three seeds per backend.
-  Neither backend lost a frame in flight. The SLKS's keyframe update is 1.02 to 1.13 times iSAM2's,
-  its latency p95 at or below iSAM2's, and its covariance (a factorisation of the window, on the
-  covariance thread) brings its estimator plus covariance CPU per keyframe to 1.7 to 2.0 times
-  iSAM2's. On EuRoC the board's iSAM2 ATE was about 10 % above the desktop estimator's over all 11
-  sequences: it splits into where the replay starts, the data path and the board, none significant
-  on its own.
+  Both backends match their desktop lockstep twins: over the 13 logs the board-to-desktop ATE ratio is
+  1.00 for iSAM2 and 0.97 for the SLKS, the NEES ratio 0.98, none significant. Three runs lost 6 to 8
+  frames, all in the first second after initialisation: until it initialises, every frame runs a full
+  initialisation attempt of 100 to 350 ms, and a run of failed attempts fills the queues. After that no
+  run lost a frame and no frame took longer than 289 ms. The SLKS's latency p95 is the lower one
+  because its covariance is off the estimator thread. The board's runs are not the desktop's runs of
+  the same seed (real time, float32 IMU in the pipe, ARM floating point, and the first frame the
+  server receives), so the comparison is between the two spreads. Which frame the server receives
+  first moves the ATE by as much as the seed does. With the same seed and the same first frame a run
+  repeats byte for byte, whatever the OpenCV worker count.
 - **Not yet:** flight.
 
 ## Layout
