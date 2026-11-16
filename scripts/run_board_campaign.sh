@@ -21,11 +21,12 @@
 #                           /data/logs/euroc/config/estimator_euroc_{mh,vicon}.yaml, server
 #                           /data/logs/euroc/config/voxl-gtsam-vio-server_euroc.yaml.
 #                           Default: the 11 sequences.
-#   VOXL    log<NNNN>       /data/logs/<log>/ (a voxl-logger log), the estimator and server configs of
+#   VOXL    any other name  /data/logs/<log>/ (a voxl-logger log), the estimator and server configs of
 #                           this repository (config/estimator_mantis2.yaml, config/voxl-gtsam-vio-server.yaml),
 #                           e.g. --logs "log0003 log0000".
 # Every log holds info.json, run/mpa/imu_apps, run/mpa/tracking_front_misp_norm, data/modalai and
-# etc/modalai (its own calibration, which the server is pointed at).
+# etc/modalai (its own calibration, which the server is pointed at). voxl-replay reads only the two
+# published channels, so the log's other channels (another camera, a VIO pipe) may be left out of the copy.
 #
 # Needs, as root: this repository on the board (e.g. /data/voxl-gtsam-vio), built there by
 # scripts/build_voxl2_native.sh. The server is build/voxl-gtsam-vio-server of the same checkout.
@@ -97,15 +98,15 @@ FAILED="${OUT}_failed"      # failed attempts, kept as evidence
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 # per log: its folder, its estimator config and its server config
-logdir() { case "$1" in log[0-9]*) echo "$LOGS/$1" ;; MH_*|V1_*|V2_*) echo "$EUROC/$1" ;; *) return 1 ;; esac; }
+logdir() { case "$1" in */*|'') return 1 ;; MH_*|V1_*|V2_*) echo "$EUROC/$1" ;; *) echo "$LOGS/$1" ;; esac; }
 ecfg() {
   case "$1" in
-    log[0-9]*) echo "$REPO/config/estimator_mantis2.yaml" ;;
     MH_*) echo "$EUROC/config/estimator_euroc_mh.yaml" ;;
     V1_*|V2_*) echo "$EUROC/config/estimator_euroc_vicon.yaml" ;;
+    *) echo "$REPO/config/estimator_mantis2.yaml" ;;
   esac
 }
-scfg() { case "$1" in log[0-9]*) echo "$REPO/config/voxl-gtsam-vio-server.yaml" ;; *) echo "$EUROC/config/voxl-gtsam-vio-server_euroc.yaml" ;; esac; }
+scfg() { case "$1" in MH_*|V1_*|V2_*) echo "$EUROC/config/voxl-gtsam-vio-server_euroc.yaml" ;; *) echo "$REPO/config/voxl-gtsam-vio-server.yaml" ;; esac; }
 
 [[ $(id -u) -eq 0 ]] || die "run as root"
 [[ -f "$BIN" ]] || die "$BIN missing"
@@ -116,7 +117,7 @@ WARM=$(for f in "$BIN" "$(command -v voxl-replay)"; do
          echo "$f"; ldd "$f" 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i}'
        done | sort -u | xargs)
 for l in $LOG_LIST; do
-  d=$(logdir "$l") || die "unknown log $l (expected log<NNNN>, MH_*, V1_* or V2_*)"
+  d=$(logdir "$l") || die "bad log name '$l' (a folder name under $LOGS, or MH_*, V1_*, V2_*)"
   for f in info.json run/mpa/imu_apps/data.csv run/mpa/tracking_front_misp_norm/data.csv \
            data/modalai/opencv_tracking_front_intrinsics.yml etc/modalai/extrinsics.conf; do
     [[ -f "$d/$f" ]] || die "$d/$f missing"
