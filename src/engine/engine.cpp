@@ -304,7 +304,7 @@ void VioEngine::run_init(double t_s, const Observation& obs, EngineOutput& out) 
                 std::cout << "init: window rejected -- SfM ill-conditioned (pre-BA reproj RMS "
                           << pre_ba_rms << " px > " << P.init_max_pre_ba_rms_px << " px); sliding.\n";
             } else {
-                AlignedInit align_try = init_align(sfm_ba, data_);
+                AlignedInit align_try = init_align(sfm_ba, data_, P.init_gravity_from_accel);
                 if (align_try.success) {
                     double vmax = 0.0;
                     for (const auto& vv : align_try.velocities)

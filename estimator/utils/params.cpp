@@ -85,6 +85,7 @@ VioParams VioParams::load(const std::string& path) {
     rd(in, "excitation_var",    p.init_excitation_var);
     rd(in, "max_pre_ba_rms_px", p.init_max_pre_ba_rms_px);
     rd(in, "max_vel_mps",       p.init_max_vel_mps);
+    rd(in, "gravity_from_accel", p.init_gravity_from_accel);
     rd(in, "iw_pose0_sigma",    p.iw_pose0_sigma);
     rd(in, "iw_vel0_sigma",     p.iw_vel0_sigma);
     rd(in, "iw_bias0_acc_sigma", p.iw_bias0_acc_sigma);

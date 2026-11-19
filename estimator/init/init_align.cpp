@@ -202,9 +202,58 @@ static void refine_gravity(const SfmResult& sfm,
 }
 
 // ---------------------------------------------------------------------------
+// Gravity direction from the accelerometer, then the velocities with gravity and scale fixed
+// ---------------------------------------------------------------------------
+// Summed velocity rows: v_{N-1} - v_0 - g T = sum_i R_wi dV_i. With the window's net velocity change
+// neglected (a 0.3 m/s horizontal change over 3 s tilts the result by about 0.6 deg), the gravity
+// direction is -sum_i R_wi dV_i, measured by the accelerometer alone.
+static Eigen::Vector3d accel_gravity_direction(const SfmResult& sfm, const EurocData& data,
+                                               const Eigen::Vector3d& b_g, const Eigen::Matrix3d& R_bc) {
+    const int N = (int)sfm.frames.size();
+    Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+    for (int i = 0; i < N - 1; ++i) {
+        auto bat = imu_between(data, sfm.frames[i].t, sfm.frames[i + 1].t);
+        auto pre = imu_preintegrate(bat.ts, bat.gyro, bat.accel, b_g, Eigen::Vector3d::Zero(), sfm.frames[i].t);
+        sum += sfm.T_wc[i].block<3, 3>(0, 0) * R_bc.transpose() * pre.dV;
+    }
+    return -sum.normalized();
+}
+
+// The linear alignment's velocity and position rows with g and s known: unknowns [v0..vN-1]. The
+// scale stays the linear solve's, as in refine_gravity: refitting it with gravity fixed moves every vertical
+// specific-force mismatch of the take-off climb into the scale (measured: scale x0.32, diverged).
+static void solve_fixed_gravity(const SfmResult& sfm, const EurocData& data, const Eigen::Vector3d& b_g,
+                                const Eigen::Matrix3d& R_bc, const Eigen::Vector3d& t_bc,
+                                const Eigen::Vector3d& g_w, double s,
+                                std::vector<Eigen::Vector3d>& velocities_out) {
+    const int N = (int)sfm.frames.size();
+    const int dim = 3 * N;
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero((N - 1) * 6, dim);
+    Eigen::VectorXd B_v = Eigen::VectorXd::Zero((N - 1) * 6);
+    for (int i = 0; i < N - 1; ++i) {
+        double dt = sfm.frames[i + 1].t - sfm.frames[i].t;
+        auto bat = imu_between(data, sfm.frames[i].t, sfm.frames[i + 1].t);
+        auto pre = imu_preintegrate(bat.ts, bat.gyro, bat.accel, b_g, Eigen::Vector3d::Zero(), sfm.frames[i].t);
+        Eigen::Matrix3d R_wi = sfm.T_wc[i].block<3, 3>(0, 0) * R_bc.transpose();
+        Eigen::Matrix3d R_wj = sfm.T_wc[i + 1].block<3, 3>(0, 0) * R_bc.transpose();
+        Eigen::Vector3d p_ci = sfm.T_wc[i].block<3, 1>(0, 3);
+        Eigen::Vector3d p_cj = sfm.T_wc[i + 1].block<3, 1>(0, 3);
+        int row = 6 * i;
+        A.block<3, 3>(row, 3 * i) = -Eigen::Matrix3d::Identity();
+        A.block<3, 3>(row, 3 * (i + 1)) = Eigen::Matrix3d::Identity();
+        B_v.segment<3>(row) = R_wi * pre.dV + g_w * dt;
+        A.block<3, 3>(row + 3, 3 * i) = Eigen::Matrix3d::Identity() * dt;
+        B_v.segment<3>(row + 3) = s * (p_cj - p_ci) - R_wi * pre.dP + (R_wi - R_wj) * t_bc - 0.5 * g_w * dt * dt;
+    }
+    Eigen::VectorXd x = (A.transpose() * A).ldlt().solve(A.transpose() * B_v);
+    velocities_out.resize(N);
+    for (int i = 0; i < N; ++i) velocities_out[i] = x.segment<3>(3 * i);
+}
+
+// ---------------------------------------------------------------------------
 // entry point
 // ---------------------------------------------------------------------------
-AlignedInit init_align(const SfmResult& sfm, const EurocData& data) {
+AlignedInit init_align(const SfmResult& sfm, const EurocData& data, bool gravity_from_accel) {
     AlignedInit out;
     out.sfm = sfm;
 
@@ -247,6 +296,16 @@ AlignedInit init_align(const SfmResult& sfm, const EurocData& data) {
     std::cout << "init_align: refined gravity  g_w=["
               << g_w(0) << "," << g_w(1) << "," << g_w(2) << "]"
               << "  |g|=" << g_w.norm() << "\n";
+
+    if (gravity_from_accel) {   // direction from the accelerometer, scale kept, velocities re-solved
+        Eigen::Vector3d g_acc = accel_gravity_direction(sfm, data, b_g, R_bc) * G_MAG;
+        double ang = std::acos(std::clamp(g_acc.dot(g_w) / (G_MAG * g_w.norm()), -1.0, 1.0)) * 180.0 / M_PI;
+        std::vector<Eigen::Vector3d> v_acc;
+        solve_fixed_gravity(sfm, data, b_g, R_bc, t_bc, g_acc, s, v_acc);
+        std::cout << "init_align: gravity from accel  tilt change " << ang << " deg, scale kept " << s << "\n";
+        g_w = g_acc;
+        velocities = std::move(v_acc);
+    }
 
     out.success = true;
     out.scale = s;

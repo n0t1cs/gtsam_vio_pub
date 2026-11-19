@@ -83,6 +83,9 @@ struct VioParams {
     double init_max_pre_ba_rms_px = 8.0;   // defer-until-well-conditioned gate [px]
     double init_max_vel_mps       = 6.0;   // VI-consistency gate: reject windows whose aligned
                                            // init velocity is implausible (bad scale -> divergence)
+    bool   init_gravity_from_accel = false; // gravity direction from the window's summed specific
+                                           // force, then v re-solved with it and the scale fixed
+                                           // (init_align). Off = the refined solve's direction.
     // continuous-window VI-BA gauge priors
     double iw_pose0_sigma     = 1e-3;      // X(0) prior sigma (rot & trans)
     double iw_vel0_sigma      = 0.3;       // V(0) prior sigma [m/s]

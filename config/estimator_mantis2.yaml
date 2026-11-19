@@ -66,6 +66,7 @@ init:
   excitation_var: 0.10
   max_pre_ba_rms_px: 6.8
   max_vel_mps: 6.0
+  gravity_from_accel: true
   iw_pose0_sigma: 1.0e-3
   iw_vel0_sigma: 0.3
   iw_bias0_acc_sigma: 0.1
